@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowers"
+version = "0.0.1"
+description = "A trustable agent with a deterministic, no-LLM verification gate."
+requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = []
+
+# Optional, environment-specific bindings. The core (engine + trust gate) depends on nothing but
+# the stdlib + sqlite3 so the offline test suite never needs the network. Real adapters live behind
+# seams and are pulled in only by the relevant extra; the offline suite uses in-repo fakes.
+[project.optional-dependencies]
+web = ["starlette>=0.37", "uvicorn>=0.30"]
+postgres = ["psycopg[binary,pool]>=3.2"]   # optional flowers/extras/ PostgresStore
+browser = ["playwright>=1.40"]   # drive Browserbase cloud sessions over CDP (no local browser download)
+e2b = ["e2b>=1.0"]               # optional flowers/extras/ E2BSandbox (Firecracker microVM)
+dev = ["pytest>=8", "ruff>=0.5"]
+all = ["flowers[web,postgres,browser,dev]"]
+
+[tool.setuptools.packages.find]
+include = ["flowers*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "live: opt-in live-adapter test — collected only under FLOWERS_LIVE=1; run via `FLOWERS_LIVE=1 pytest -m live`",
+]
+# pytest-asyncio is present in the global interpreter; pin its fixture loop scope to silence its
+# unset-default deprecation warning (flowers' own tests are synchronous).
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]  # long lines tolerated in docstrings/data tables
