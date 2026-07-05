@@ -99,7 +99,9 @@ const chat=document.getElementById('chat'), msg=document.getElementById('msg'),
 const phaseEl=document.getElementById('phase'), timeline=document.getElementById('timeline'),
   tlempty=document.getElementById('tlempty');
 
-let rid=null, es=null, shown=0, terminal=false, busy=false;
+// lastId is the SSE resume cursor: event ids are durable (assigned by the server's store), so a
+// reconnect — even to a RESTARTED server — resumes exactly after the last rendered event.
+let rid=null, es=null, lastId=0, terminal=false, busy=false;
 let steps=[], active=-1;
 
 // ---- left status panel: a live timeline parsed from the plan + progress events ----
@@ -216,33 +218,54 @@ function asking(kind){
   msg.focus();
 }
 
+let progLine=null;   // pre-plan progress collapses into ONE updating status line (not a pile-up)
 function render(k,d){
   clearWorking();
   const text=d.text||'';
-  if(k==='progress'){ if(steps.length)onProgress(text); else sys(text); return; }
-  if(k==='plan_announce'){bubble('agent',k,text);buildTimeline(text);return;}
+  if(k==='progress'){
+    if(steps.length){onProgress(text);}
+    else if(progLine){progLine.textContent=text;scroll();}
+    else{progLine=sys(text);}
+    return;
+  }
+  if(k==='plan_announce'){progLine=null;bubble('agent',k,text);buildTimeline(text);return;}
   if(k==='approval'||k==='clarify'){bubble('agent','ask',text);
     const w=chat.lastChild;const t=document.createElement('div');t.className='tag';
     t.textContent=TAG[k];w.insertBefore(t,w.firstChild);asking(k);setPhase('Waiting for you');return;}
   if(k==='connect'){bubble('agent','connect',text,d);setPhase('Connect account');return;}
-  if(k==='done'||k==='escalated'){bubble('agent',k,text);terminal=true;closeStream();idle();
-    if(k==='done'){allDone();setPhase('Done','✓');}else setPhase('Escalated');return;}
+  if(k==='done'){bubble('agent',k,text);terminal=true;closeStream();idle();
+    allDone();setPhase('Done','✓');return;}
+  if(k==='escalated'){
+    // An escalation is a PARKED conversation, not a dead end: the stream stays open and a reply
+    // continues the run (or "no" closes it). See operator._resume_escalated.
+    bubble('agent',k,text);clearQuick();setPhase('Escalated — reply to continue');
+    msg.placeholder='Reply to continue, or "no" to stop…';msg.focus();return;}
   bubble('agent',k,text);   // notify
 }
 
 function closeStream(){if(es){es.close();es=null;}}
 function connect(){
   closeStream();
-  let idx=0; const cur=new EventSource('/events/'+rid); es=cur;
+  const cur=new EventSource('/events/'+rid+(lastId?('?after='+lastId):'')); es=cur;
   const handle=(k,e)=>{
     if(es!==cur)return;
     let d; try{d=JSON.parse(e.data);}catch(_){return;}
-    if(idx<shown){idx++;return;}           // skip events already rendered (replay after reconnect)
-    idx++; shown++; render(k,d);
+    const id=Number(e.lastEventId||d.id||0);
+    if(id && id<=lastId)return;            // already rendered (duplicate replay)
+    if(id)lastId=id;
+    render(k,d);
   };
   KINDS.forEach(k=>cur.addEventListener(k,e=>handle(k,e)));
-  cur.onerror=()=>{cur.close();if(es===cur)es=null;
-    if(!terminal && rid){setTimeout(()=>{if(!es&&!terminal)connect();},700);}};
+  cur.onerror=async()=>{cur.close();if(es===cur)es=null;
+    if(terminal||!rid)return;
+    // The server ends the stream when the run CLOSES (done/stopped) — check before reconnecting,
+    // so a closed run settles to idle instead of a reconnect loop.
+    try{
+      const r=await fetch('/api/runs/'+rid); const j=await r.json();
+      if(j.status==='done'||j.status==='stopped'){terminal=true;clearWorking();idle();
+        if(j.status==='done')setPhase('Done','✓');else setPhase('Stopped');return;}
+    }catch(_){}
+    setTimeout(()=>{if(!es&&!terminal)connect();},700);};
 }
 
 async function post(url,body){
@@ -253,11 +276,15 @@ async function submit(){
   bubble('user',null,text); msg.value=''; clearQuick(); setBusy(true); showWorking();
   try{
     if(!rid||terminal){
-      terminal=false; shown=0; resetTimeline(); setPhase('Planning…');
+      terminal=false; lastId=0; progLine=null; resetTimeline(); setPhase('Planning…');
       const r=await post('/api/goal',{text});
-      const j=await r.json(); rid=j.run_id; connect();
+      const j=await r.json();
+      if(!r.ok){clearWorking();sys(j.error||'request failed');setPhase('Idle');return;}
+      rid=j.run_id; connect();
     }else{
-      const r=await post('/api/answer',{run_id:rid,text}); await r.json();
+      const r=await post('/api/answer',{run_id:rid,text});
+      const j=await r.json();
+      if(!r.ok){clearWorking();sys(j.error||'request failed');return;}
       if(!es)connect();
     }
   }catch(_){clearWorking();sys('network error — is the server running?');}

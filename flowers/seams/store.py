@@ -16,8 +16,10 @@ path resumes from ``get_run`` + ``get_plan`` + the persisted effects/approvals.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
+import threading
 
 from flowers.types import (
     ApprovalRequest,
@@ -223,14 +225,34 @@ class SqliteStore:
 
     def __init__(self, path: str = ":memory:") -> None:
         self.path = path
-        # ``check_same_thread=False`` keeps the dev store usable from a worker thread; the engine
-        # serializes its own access. JSON columns keep the schema stable as types evolve.
+        # ONE connection shared by every thread that touches the store: the event-loop thread (SSE
+        # polls, readiness probes), the background drive worker, and the tick poller. sqlite3 forbids
+        # concurrent use of one connection, so ALL access — reads included — is serialized by a
+        # process-local lock (``_locked``). WAL + busy_timeout guard the other axis: a SECOND process
+        # (or the timers db) on the same file waits briefly instead of raising "database is locked",
+        # and WAL readers never block the writer.
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        self._db.execute("PRAGMA busy_timeout = 5000")
+        self._db.execute("PRAGMA journal_mode = WAL")     # no-op ("memory") for :memory: stores
+        self._db.execute("PRAGMA synchronous = NORMAL")   # safe under WAL; every mutation still commits
         self._init_tables()
 
+    @contextlib.contextmanager
+    def _locked(self):
+        """Serialize all access to the shared connection (reads AND writes — concurrent reads on one
+        sqlite3 connection raise 'recursive use of cursors'). Re-entrant, so a compound operation can
+        hold the lock across a read-then-write without deadlocking on its own helpers."""
+        with self._lock:
+            yield self._db
+
     def _init_tables(self) -> None:
-        c = self._db
+        with self._locked() as c:
+            self._create_tables(c)
+
+    @staticmethod
+    def _create_tables(c) -> None:
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS runs (
@@ -265,6 +287,26 @@ class SqliteStore:
                 run_id TEXT PRIMARY KEY,
                 data   TEXT NOT NULL
             );
+            -- The durable owner-facing event log (plan announcements, progress, approvals, done):
+            -- what the dashboard replays after a reconnect OR a server restart. eid is the per-run
+            -- monotonic SSE resume cursor. Retained for the life of the run's row, like effects/usage
+            -- (it is the audit trail); events are small JSON rows appended at human pace.
+            CREATE TABLE IF NOT EXISTS events (
+                seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                eid    INTEGER NOT NULL,
+                data   TEXT NOT NULL
+            );
+            -- Owner messages that arrived while the run was mid-drive (no parked question to answer).
+            -- A side table rather than a RunState field: the drive thread rewrites the run's JSON blob
+            -- on every save_run, so a note stored inside RunState by the answer thread would be lost
+            -- to a concurrent overwrite. take_notes() consumes atomically under the store lock.
+            CREATE TABLE IF NOT EXISTS run_notes (
+                seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id   TEXT NOT NULL,
+                text     TEXT NOT NULL,
+                consumed INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS user_memory (
                 tenant_id TEXT PRIMARY KEY,
                 content   TEXT NOT NULL
@@ -281,6 +323,8 @@ class SqliteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_effects_run   ON effects(run_id, seq);
             CREATE INDEX IF NOT EXISTS idx_usage_run     ON usage(run_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_run_eid ON events(run_id, eid);
+            CREATE INDEX IF NOT EXISTS idx_notes_run     ON run_notes(run_id, consumed);
             """
         )
         c.commit()
@@ -288,31 +332,35 @@ class SqliteStore:
     # --- runs ---
 
     def create_run(self, run: RunState) -> None:
-        self._db.execute(
-            "INSERT INTO runs (run_id, tenant_id, data) VALUES (?, ?, ?)",
-            (run.run_id, run.tenant_id, json.dumps(_run_to_dict(run))),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO runs (run_id, tenant_id, data) VALUES (?, ?, ?)",
+                (run.run_id, run.tenant_id, json.dumps(_run_to_dict(run))),
+            )
+            c.commit()
 
     def get_run(self, run_id: str) -> RunState | None:
-        row = self._db.execute("SELECT data FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        with self._locked() as c:
+            row = c.execute("SELECT data FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             return None
         return _run_from_dict(json.loads(row["data"]))
 
     def save_run(self, run: RunState) -> None:
         """Upsert: update an existing run or insert if new (idempotent persistence)."""
-        self._db.execute(
-            "INSERT INTO runs (run_id, tenant_id, data) VALUES (?, ?, ?) "
-            "ON CONFLICT(run_id) DO UPDATE SET tenant_id = excluded.tenant_id, data = excluded.data",
-            (run.run_id, run.tenant_id, json.dumps(_run_to_dict(run))),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO runs (run_id, tenant_id, data) VALUES (?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET tenant_id = excluded.tenant_id, data = excluded.data",
+                (run.run_id, run.tenant_id, json.dumps(_run_to_dict(run))),
+            )
+            c.commit()
 
     def list_runs(self, tenant_id: str) -> list[RunState]:
-        rows = self._db.execute(
-            "SELECT data FROM runs WHERE tenant_id = ? ORDER BY rowid", (tenant_id,)
-        ).fetchall()
+        with self._locked() as c:
+            rows = c.execute(
+                "SELECT data FROM runs WHERE tenant_id = ? ORDER BY rowid", (tenant_id,)
+            ).fetchall()
         return [_run_from_dict(json.loads(r["data"])) for r in rows]
 
     def running_runs(self) -> list[RunState]:
@@ -320,23 +368,26 @@ class SqliteStore:
         sweep's input. Neither state schedules a timer, so a run found here at process startup is necessarily
         a crash orphan (nothing is actively driving yet). Filtered in SQL so a growing runs table is not
         fully deserialized."""
-        rows = self._db.execute(
-            "SELECT data FROM runs WHERE json_extract(data, '$.status') IN (?, ?) ORDER BY rowid",
-            (RunStatus.RUNNING.value, RunStatus.PLANNING.value)).fetchall()
+        with self._locked() as c:
+            rows = c.execute(
+                "SELECT data FROM runs WHERE json_extract(data, '$.status') IN (?, ?) ORDER BY rowid",
+                (RunStatus.RUNNING.value, RunStatus.PLANNING.value)).fetchall()
         return [_run_from_dict(json.loads(r["data"])) for r in rows]
 
     # --- plans ---
 
     def save_plan(self, run_id: str, plan: Plan) -> None:
-        self._db.execute(
-            "INSERT INTO plans (run_id, data) VALUES (?, ?) "
-            "ON CONFLICT(run_id) DO UPDATE SET data = excluded.data",
-            (run_id, json.dumps(_plan_to_dict(plan))),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO plans (run_id, data) VALUES (?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET data = excluded.data",
+                (run_id, json.dumps(_plan_to_dict(plan))),
+            )
+            c.commit()
 
     def get_plan(self, run_id: str) -> Plan | None:
-        row = self._db.execute("SELECT data FROM plans WHERE run_id = ?", (run_id,)).fetchone()
+        with self._locked() as c:
+            row = c.execute("SELECT data FROM plans WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             return None
         return _plan_from_dict(json.loads(row["data"]))
@@ -344,47 +395,101 @@ class SqliteStore:
     # --- effects ---
 
     def append_effect(self, run_id: str, effect: EffectRecord) -> None:
-        self._db.execute(
-            "INSERT INTO effects (run_id, data) VALUES (?, ?)",
-            (run_id, json.dumps(_effect_to_dict(effect))),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO effects (run_id, data) VALUES (?, ?)",
+                (run_id, json.dumps(_effect_to_dict(effect))),
+            )
+            c.commit()
 
     def get_effects(self, run_id: str) -> list[EffectRecord]:
         """Return this run's effects in append order (the autoincrement seq preserves it)."""
-        rows = self._db.execute(
-            "SELECT data FROM effects WHERE run_id = ? ORDER BY seq", (run_id,)
-        ).fetchall()
+        with self._locked() as c:
+            rows = c.execute(
+                "SELECT data FROM effects WHERE run_id = ? ORDER BY seq", (run_id,)
+            ).fetchall()
         return [_effect_from_dict(json.loads(r["data"])) for r in rows]
+
+    # --- events (the durable owner-facing per-run log the dashboard replays) ---
+
+    def append_event(self, run_id: str, event: dict) -> int:
+        """Append an owner-facing event to the run's durable log; returns its per-run monotonic id.
+        The id is assigned under the store lock (MAX(eid)+1), so ids are gapless and strictly
+        increasing per run — the resume cursor the SSE protocol (Last-Event-ID) relies on."""
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT COALESCE(MAX(eid), 0) + 1 AS n FROM events WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            eid = int(row["n"])
+            c.execute(
+                "INSERT INTO events (run_id, eid, data) VALUES (?, ?, ?)",
+                (run_id, eid, json.dumps(dict(event))),
+            )
+            c.commit()
+        return eid
+
+    def get_events(self, run_id: str, *, after: int = 0) -> list[dict]:
+        """The run's events with eid > ``after``, in order. Each dict carries its ``id`` (the eid)."""
+        with self._locked() as c:
+            rows = c.execute(
+                "SELECT eid, data FROM events WHERE run_id = ? AND eid > ? ORDER BY eid",
+                (run_id, int(after)),
+            ).fetchall()
+        return [{**json.loads(r["data"]), "id": r["eid"]} for r in rows]
+
+    # --- mid-run owner notes (messages that arrive while the run is driving) ---
+
+    def add_note(self, run_id: str, text: str) -> None:
+        with self._locked() as c:
+            c.execute("INSERT INTO run_notes (run_id, text) VALUES (?, ?)", (run_id, text))
+            c.commit()
+
+    def take_notes(self, run_id: str) -> list[str]:
+        """Return + mark-consumed the run's unconsumed owner notes, in arrival order — atomic under
+        the store lock, so a note is folded into exactly one decision point (never two, never zero)."""
+        with self._locked() as c:
+            rows = c.execute(
+                "SELECT seq, text FROM run_notes WHERE run_id = ? AND consumed = 0 ORDER BY seq",
+                (run_id,),
+            ).fetchall()
+            if rows:
+                c.executemany("UPDATE run_notes SET consumed = 1 WHERE seq = ?",
+                              [(r["seq"],) for r in rows])
+                c.commit()
+        return [r["text"] for r in rows]
 
     # --- approvals ---
 
     def save_approval(self, approval: ApprovalRequest) -> None:
-        self._db.execute(
-            "INSERT INTO approvals (approval_id, run_id, data, answer) VALUES (?, ?, ?, NULL) "
-            "ON CONFLICT(approval_id) DO UPDATE SET run_id = excluded.run_id, data = excluded.data",
-            (approval.id, approval.run_id, json.dumps(_approval_to_dict(approval))),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO approvals (approval_id, run_id, data, answer) VALUES (?, ?, ?, NULL) "
+                "ON CONFLICT(approval_id) DO UPDATE SET run_id = excluded.run_id, data = excluded.data",
+                (approval.id, approval.run_id, json.dumps(_approval_to_dict(approval))),
+            )
+            c.commit()
 
     def get_approval(self, approval_id: str) -> ApprovalRequest | None:
-        row = self._db.execute(
-            "SELECT data FROM approvals WHERE approval_id = ?", (approval_id,)
-        ).fetchone()
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT data FROM approvals WHERE approval_id = ?", (approval_id,)
+            ).fetchone()
         if row is None:
             return None
         return _approval_from_dict(json.loads(row["data"]))
 
     def resolve_approval(self, approval_id: str, answer: str) -> None:
-        self._db.execute(
-            "UPDATE approvals SET answer = ? WHERE approval_id = ?", (answer, approval_id)
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "UPDATE approvals SET answer = ? WHERE approval_id = ?", (answer, approval_id)
+            )
+            c.commit()
 
     def get_answer(self, approval_id: str) -> str | None:
-        row = self._db.execute(
-            "SELECT answer FROM approvals WHERE approval_id = ?", (approval_id,)
-        ).fetchone()
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT answer FROM approvals WHERE approval_id = ?", (approval_id,)
+            ).fetchone()
         if row is None:
             return None
         return row["answer"]
@@ -394,83 +499,94 @@ class SqliteStore:
     def record_usage(
         self, *, tenant_id: str, run_id: str, kind: str, cost_usd: float, detail: dict
     ) -> None:
-        self._db.execute(
-            "INSERT INTO usage (tenant_id, run_id, kind, cost_usd, detail) VALUES (?, ?, ?, ?, ?)",
-            (tenant_id, run_id, kind, float(cost_usd), json.dumps(dict(detail or {}))),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO usage (tenant_id, run_id, kind, cost_usd, detail) VALUES (?, ?, ?, ?, ?)",
+                (tenant_id, run_id, kind, float(cost_usd), json.dumps(dict(detail or {}))),
+            )
+            c.commit()
 
     def run_spend(self, run_id: str) -> float:
-        row = self._db.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM usage WHERE run_id = ?",
-            (run_id,),
-        ).fetchone()
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM usage WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
         return float(row["total"])
 
     # --- continuation (durable resume-at-action) ---
 
     def save_continuation(self, run_id: str, data: dict) -> None:
-        self._db.execute(
-            "INSERT INTO continuations (run_id, data) VALUES (?, ?) "
-            "ON CONFLICT(run_id) DO UPDATE SET data = excluded.data",
-            (run_id, json.dumps(dict(data or {}))),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO continuations (run_id, data) VALUES (?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET data = excluded.data",
+                (run_id, json.dumps(dict(data or {}))),
+            )
+            c.commit()
 
     def get_continuation(self, run_id: str) -> dict | None:
-        row = self._db.execute(
-            "SELECT data FROM continuations WHERE run_id = ?", (run_id,)
-        ).fetchone()
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT data FROM continuations WHERE run_id = ?", (run_id,)
+            ).fetchone()
         return json.loads(row["data"]) if row is not None else None
 
     # --- per-user memory (cross-session, self-curated markdown) ---
 
     def get_memory(self, tenant_id: str) -> str:
-        row = self._db.execute(
-            "SELECT content FROM user_memory WHERE tenant_id = ?", (tenant_id,)
-        ).fetchone()
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT content FROM user_memory WHERE tenant_id = ?", (tenant_id,)
+            ).fetchone()
         return row["content"] if row is not None else ""
 
     def save_memory(self, tenant_id: str, content: str) -> None:
-        self._db.execute(
-            "INSERT INTO user_memory (tenant_id, content) VALUES (?, ?) "
-            "ON CONFLICT(tenant_id) DO UPDATE SET content = excluded.content",
-            (tenant_id, content or ""),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO user_memory (tenant_id, content) VALUES (?, ?) "
+                "ON CONFLICT(tenant_id) DO UPDATE SET content = excluded.content",
+                (tenant_id, content or ""),
+            )
+            c.commit()
 
     # --- learned-trust counters (per-user approval counts per action class) ---
 
     def get_trust(self, tenant_id: str) -> dict:
-        row = self._db.execute(
-            "SELECT data FROM trust_counts WHERE tenant_id = ?", (tenant_id,)
-        ).fetchone()
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT data FROM trust_counts WHERE tenant_id = ?", (tenant_id,)
+            ).fetchone()
         return json.loads(row["data"]) if row is not None else {}
 
     def save_trust(self, tenant_id: str, counts: dict) -> None:
-        self._db.execute(
-            "INSERT INTO trust_counts (tenant_id, data) VALUES (?, ?) "
-            "ON CONFLICT(tenant_id) DO UPDATE SET data = excluded.data",
-            (tenant_id, json.dumps(counts or {})),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO trust_counts (tenant_id, data) VALUES (?, ?) "
+                "ON CONFLICT(tenant_id) DO UPDATE SET data = excluded.data",
+                (tenant_id, json.dumps(counts or {})),
+            )
+            c.commit()
 
     # --- persistent browser contexts (per (tenant, site) logged-in session profile) ---
 
     def get_browser_context(self, tenant_id: str, site: str) -> str | None:
-        row = self._db.execute(
-            "SELECT context_id FROM browser_contexts WHERE tenant_id = ? AND site = ?",
-            (tenant_id, site),
-        ).fetchone()
+        with self._locked() as c:
+            row = c.execute(
+                "SELECT context_id FROM browser_contexts WHERE tenant_id = ? AND site = ?",
+                (tenant_id, site),
+            ).fetchone()
         return row["context_id"] if row is not None else None
 
     def save_browser_context(self, tenant_id: str, site: str, context_id: str) -> None:
-        self._db.execute(
-            "INSERT INTO browser_contexts (tenant_id, site, context_id) VALUES (?, ?, ?) "
-            "ON CONFLICT(tenant_id, site) DO UPDATE SET context_id = excluded.context_id",
-            (tenant_id, site, context_id),
-        )
-        self._db.commit()
+        with self._locked() as c:
+            c.execute(
+                "INSERT INTO browser_contexts (tenant_id, site, context_id) VALUES (?, ?, ?) "
+                "ON CONFLICT(tenant_id, site) DO UPDATE SET context_id = excluded.context_id",
+                (tenant_id, site, context_id),
+            )
+            c.commit()
 
     def close(self) -> None:
-        self._db.close()
+        with self._locked() as c:
+            c.close()

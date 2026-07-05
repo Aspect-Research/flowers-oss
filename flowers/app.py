@@ -59,20 +59,28 @@ def build_app(*, db_path: str = "flowers.db", timers_path: str = "flowers_timers
     and are not wired here — see the README to swap one in.
     """
     store = SqliteStore(db_path)
-    channel = WebChannel()
+    channel = WebChannel(store)   # events write through to the store: the log survives a restart
+    live_model = OpenRouterModel()
+    # With no model key, POST /api/goal must FAIL FAST with an actionable message — the wired FakeModel
+    # has no scripted answers outside the test suite, so accepting a goal would let it die mid-run.
+    # Everything else (the dashboard, /health, the event log) still serves at $0.
+    degraded = (None if live_model.available() else
+                "no model is configured — set OPENROUTER_API_KEY in .env (see .env.example) and "
+                "restart; flowers cannot run goals without a model")
     operator = Operator(
         channel=channel,
-        model=_pick(OpenRouterModel(), FakeModel([])),
+        model=_pick(live_model, FakeModel([])),
         search=_pick(TavilySearch(), FakeSearch()),
         integrations=_pick(ArcadeIntegrations(), FakeIntegrations()),
-        # the store doubles as the tenant-scoped browser-context registry (persistent logins).
+        # the store doubles as the browser-context registry (persistent per-site logins).
         browser=_pick(BrowserbaseBrowser(context_store=store), FakeBrowser()),
         store=store,
         timers=LocalTimers(timers_path),
         tracer=LocalTracer(),
     )
     control_plane = ControlPlane(store=store, operator=operator)
-    return create_app(control_plane, channel, poll_interval=_tick_seconds(default=15.0))
+    return create_app(control_plane, channel, poll_interval=_tick_seconds(default=15.0),
+                      degraded=degraded)
 
 
 # Load `.env` (KEY=VALUE) into the environment before wiring adapters, so keys set there are seen by

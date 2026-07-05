@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 
 from flowers.seams.interfaces import Timer
@@ -42,32 +43,39 @@ class LocalTimers:
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self._db_path = db_path
-        # ``check_same_thread=False`` keeps an in-memory db usable from a poller thread; correctness
-        # is preserved because every mutation commits immediately.
+        # One connection shared by the tick-poller thread and the drive worker(s): sqlite3 forbids
+        # concurrent use of a single connection, so every method serializes on a process-local lock.
+        # WAL + busy_timeout make a second PROCESS on the same file wait briefly instead of raising
+        # "database is locked".
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute("PRAGMA journal_mode = WAL")     # no-op ("memory") for :memory: dbs
+        self._conn.execute("PRAGMA synchronous = NORMAL")   # safe under WAL; mutations still commit
         self._offset: float = 0.0
         self._ensure_schema()
 
     # --- schema ---------------------------------------------------------------
 
     def _ensure_schema(self) -> None:
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS timers (
-                id        TEXT PRIMARY KEY,
-                run_id    TEXT NOT NULL,
-                wake_at   REAL NOT NULL,
-                kind      TEXT NOT NULL,
-                payload   TEXT NOT NULL DEFAULT '{}',
-                cancelled INTEGER NOT NULL DEFAULT 0,
-                fired     INTEGER NOT NULL DEFAULT 0
+        with self._lock:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS timers (
+                    id        TEXT PRIMARY KEY,
+                    run_id    TEXT NOT NULL,
+                    wake_at   REAL NOT NULL,
+                    kind      TEXT NOT NULL,
+                    payload   TEXT NOT NULL DEFAULT '{}',
+                    cancelled INTEGER NOT NULL DEFAULT 0,
+                    fired     INTEGER NOT NULL DEFAULT 0
+                )
+                """
             )
-            """
-        )
-        self._conn.execute("CREATE INDEX IF NOT EXISTS ix_timers_run ON timers(run_id)")
-        self._conn.execute("CREATE INDEX IF NOT EXISTS ix_timers_wake ON timers(wake_at)")
-        self._conn.commit()
+            self._conn.execute("CREATE INDEX IF NOT EXISTS ix_timers_run ON timers(run_id)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS ix_timers_wake ON timers(wake_at)")
+            self._conn.commit()
 
     # --- DurableTimers protocol ----------------------------------------------
 
@@ -95,11 +103,12 @@ class LocalTimers:
             kind=kind,
             payload=dict(payload or {}),
         )
-        self._conn.execute(
-            "INSERT INTO timers (id, run_id, wake_at, kind, payload) VALUES (?, ?, ?, ?, ?)",
-            (timer.id, timer.run_id, timer.wake_at, timer.kind, json.dumps(timer.payload)),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO timers (id, run_id, wake_at, kind, payload) VALUES (?, ?, ?, ?, ?)",
+                (timer.id, timer.run_id, timer.wake_at, timer.kind, json.dumps(timer.payload)),
+            )
+            self._conn.commit()
         return timer
 
     def due(self, *, at: float | None = None) -> list[Timer]:
@@ -110,29 +119,34 @@ class LocalTimers:
         a new timer.
         """
         cutoff = self.now() if at is None else float(at)
-        rows = self._conn.execute(
-            "SELECT * FROM timers WHERE wake_at <= ? AND cancelled = 0 AND fired = 0 "
-            "ORDER BY wake_at ASC, id ASC",
-            (cutoff,),
-        ).fetchall()
-        timers = [self._row_to_timer(r) for r in rows]
-        if timers:
-            self._conn.executemany(
-                "UPDATE timers SET fired = 1 WHERE id = ?",
-                [(t.id,) for t in timers],
-            )
-            self._conn.commit()
+        # SELECT + mark-fired as ONE locked section: two concurrent due() callers (e.g. overlapping
+        # tick threads) must never both claim the same timer.
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM timers WHERE wake_at <= ? AND cancelled = 0 AND fired = 0 "
+                "ORDER BY wake_at ASC, id ASC",
+                (cutoff,),
+            ).fetchall()
+            timers = [self._row_to_timer(r) for r in rows]
+            if timers:
+                self._conn.executemany(
+                    "UPDATE timers SET fired = 1 WHERE id = ?",
+                    [(t.id,) for t in timers],
+                )
+                self._conn.commit()
         return timers
 
     def cancel(self, timer_id: str) -> None:
         """Cancel a single timer so it can never become ``due``."""
-        self._conn.execute("UPDATE timers SET cancelled = 1 WHERE id = ?", (timer_id,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("UPDATE timers SET cancelled = 1 WHERE id = ?", (timer_id,))
+            self._conn.commit()
 
     def cancel_for_run(self, run_id: str) -> None:
         """Cancel every timer parked for ``run_id`` (e.g. the run finished or was stopped)."""
-        self._conn.execute("UPDATE timers SET cancelled = 1 WHERE run_id = ?", (run_id,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("UPDATE timers SET cancelled = 1 WHERE run_id = ?", (run_id,))
+            self._conn.commit()
 
     def advance(self, seconds: float) -> None:
         """Fast-forward the virtual clock by ``seconds`` (dev/test only — no real sleeping)."""
@@ -152,4 +166,5 @@ class LocalTimers:
 
     def close(self) -> None:
         """Close the underlying sqlite connection (file dbs persist on disk regardless)."""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

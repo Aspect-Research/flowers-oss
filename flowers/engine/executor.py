@@ -213,7 +213,16 @@ class Executor:
             return StepResult(**kw)
 
         for _ in range(self.budget.max_iterations):
-            resp = broker.complete(messages, tools=TOOL_SPECS, role=role)
+            try:
+                resp = broker.complete(messages, tools=TOOL_SPECS, role=role)
+            except Exception as e:
+                # A RAISED model/transport failure (adapter unavailable, exhausted fake, transport bug)
+                # must surface as an honest step failure — never crash the drive thread, which would
+                # strand the run RUNNING forever with a dashboard spinner that never clears. The
+                # returned-error path (finish_reason == "error") is handled just below.
+                return _result(claimed_done=False, ok=False,
+                               text=f"model call failed: {type(e).__name__}: {e}",
+                               signals={"tool_failed": "model", "reason": "model_error"})
             if not resp.tool_calls:
                 # A persistent model/transport error must NOT masquerade as an empty "done" — report it.
                 if getattr(resp, "finish_reason", "") == "error":

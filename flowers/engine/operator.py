@@ -12,6 +12,7 @@ not re-run.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ from flowers.types import (
     StepStatus,
     now_ts,
 )
+
+_log = logging.getLogger("flowers.operator")
 
 _LADDER_HARD_CAP = 12      # absolute backstop per step on relentless retries; budget + deadline_ts are the
 #                            REAL terminators. Each climb escalates the feedback so retries get CREATIVE.
@@ -277,7 +280,8 @@ class Operator:
                     return self._resume_step(run, goal, rs)   # resume-at-action: run the approved action exactly
                 self._unpark_step(run)
                 return self._drive(run, goal)
-            self._escalate(run, f"owner declined: {appr.effect_label or appr.prompt}")
+            self._escalate(run, f"owner declined: {appr.effect_label or appr.prompt}",
+                           reason_code="owner_declined")
             return run
 
         if run.status is RunStatus.AWAITING_GO:
@@ -302,7 +306,31 @@ class Operator:
         if run.status is RunStatus.WAITING:
             return self._resume_waiting(run, goal, event=event)
 
+        if run.status is RunStatus.ESCALATED:
+            return self._resume_escalated(run, goal, answer)
+
+        if (run.status in (RunStatus.RUNNING, RunStatus.PLANNING, RunStatus.PENDING)
+                and answer and answer.strip()):
+            # A message while the run is mid-drive: NEVER dropped. Queue it durably for the next
+            # decision point (next step's feedback / the next replan) and acknowledge at once — the
+            # dashboard shows a spinner that only clears when an event arrives. Context only: a note
+            # cannot mint a grant or bypass an approval. This thread must NOT call _drive (the drive
+            # thread is still running this run — a second drive would race it).
+            self.store.add_note(run.run_id, answer.strip())
+            self._emit(run, "notify", "noted — I'm mid-task; I'll fold that in at my next step.")
+            return run
+
         return run
+
+    def fail(self, run_id: str, reason: str) -> None:
+        """Public crash surface: escalate a run that an unexpected exception left in-flight, so the
+        failure is an honest parked outcome (answerable, visible) rather than a silent stuck-RUNNING.
+        No-op if the run is already terminal or parked — the exception may have raced a legitimate
+        settle (e.g. the drive parked the run for approval and THEN the thread died)."""
+        run = self.store.get_run(run_id)
+        if run is None or run.status not in (RunStatus.RUNNING, RunStatus.PLANNING, RunStatus.PENDING):
+            return
+        self._escalate(run, reason, reason_code="internal_error")
 
     def recover(self, run_id: str) -> RunState:
         """Crash recovery: a run left in a synchronous in-flight state (RUNNING or PLANNING) by a process
@@ -332,6 +360,9 @@ class Operator:
                 reset = True
         if reset:
             self.store.save_plan(run.run_id, plan)
+        # Orient the owner: the durable event log means a reconnected dashboard replays the pre-crash
+        # timeline — this marks where the old process ended and the recovery re-drive picks up.
+        self._emit(run, "progress", "recovering after a restart — resuming where I left off")
         return self._drive(run, goal)
 
     # ================================================================ planning / driving
@@ -396,6 +427,13 @@ class Operator:
         broker = self._broker(run)
         grants = self._grants.get(run.run_id, set())
         feedback = step.params.get("_feedback", "")
+        # Fold in any owner messages that arrived while the run was mid-drive (queued by resume()'s
+        # RUNNING branch). Prompt CONTEXT only: a note can steer the work, but it can never mint a
+        # grant or bypass an approval — authorization still flows only through the parked-approval path.
+        notes = self.store.take_notes(run.run_id)
+        if notes:
+            feedback = (feedback + "\n\nWHILE YOU WERE WORKING, the owner said (fold this in): "
+                        + "; ".join(notes)).strip()
         # Model escalation (lever 1): on hard ladder rungs use the STRONGER executor model — more horsepower
         # exactly when the cheap approach has already failed. Derived from the PERSISTED rung, so it survives
         # a restart for free (no new field). Verification is untouched: the stronger model still routes every
@@ -429,6 +467,50 @@ class Operator:
         outcome = self._handle_step_result(run, goal, plan, step, result, allow_redirect=False)
         if outcome in ("parked", "escalated"):
             return run
+        return self._drive(run, goal)
+
+    def _resume_escalated(self, run, goal, answer: str | None) -> RunState:
+        """An escalation is a PARKED conversation, not a dead end: the owner's reply either redirects
+        the run (re-architect the remaining work around their guidance) or closes it ("no" -> STOPPED).
+        The pending 'review' approval is the anchor the answer resolves. Continuing never widens
+        authorization — every new action still flows through the broker + read-back gate, and the
+        budget/deadline terminators still hold (no headroom -> honest refusal, stays parked)."""
+        ans = answer if answer is not None else self._answer_for(run)
+        if ans is None or not ans.strip():
+            return run                                   # still waiting on the owner
+        if parse_answer(ans)["decision"] == "no":
+            run.status = RunStatus.STOPPED
+            run.pending_approval = None
+            run.updated_at = now_ts()
+            self.store.save_run(run)
+            self.timers.cancel_for_run(run.run_id)
+            self._emit(run, "notify", "okay — leaving it here.")
+            return run
+        run.spent_usd = self.store.run_spend(run.run_id)   # refresh: spend may postdate the escalation
+        if not self._has_headroom(run):
+            self._emit(run, "notify",
+                       f"I can't continue — the budget (${run.budget_usd:.2f}) or time limit is spent. "
+                       "Start a new request and I'll pick up from what's done.")
+            return run
+        run.pending_approval = None
+        run.status = RunStatus.RUNNING
+        run.updated_at = now_ts()
+        self.store.save_run(run)
+        plan = self.store.get_plan(run.run_id)
+        done_steps = [s for s in plan.steps if s.status is StepStatus.DONE] if plan else []
+        newplan = self.planner.replan(
+            goal, done_steps,
+            reason="the owner replied to the escalation",
+            new_info=f"OWNER GUIDANCE: {ans}",
+            broker=self._broker(run), catalog=CAPABILITY_CATALOG,
+            memory=self.store.get_memory(run.tenant_id))
+        if len(newplan.steps) <= len(done_steps):
+            # The replan produced no new work — park again honestly rather than spin.
+            self._escalate(run, "I couldn't turn that into a next step — can you rephrase what "
+                                "you'd like me to do?")
+            return run
+        self.store.save_plan(run.run_id, newplan)
+        self._emit(run, "progress", "picking the run back up with your guidance")
         return self._drive(run, goal)
 
     def _park_connect(self, run, na) -> str:
@@ -494,10 +576,12 @@ class Operator:
     def _handle_step_result(self, run, goal, plan, step, result, *, allow_redirect: bool) -> str:
         run.spent_usd = self.store.run_spend(run.run_id)
         if run.spent_usd > run.budget_usd:
-            self._escalate(run, f"budget of ${run.budget_usd:.2f} reached (spent ${run.spent_usd:.2f})")
+            self._escalate(run, f"budget of ${run.budget_usd:.2f} reached (spent ${run.spent_usd:.2f})",
+                           reason_code="budget_exhausted")
             return "escalated"
         if run.deadline_ts and self.timers.now() >= run.deadline_ts:
-            self._escalate(run, "time budget reached — surfacing where I got to")
+            self._escalate(run, "time budget reached — surfacing where I got to",
+                           reason_code="deadline_exhausted")
             return "escalated"
 
         # Persist the REAL effects (forwarded/failed/refused) FIRST — BEFORE any needs_approval park — so a
@@ -576,7 +660,13 @@ class Operator:
 
         if (result.signals.get("tool_failed") or result.signals.get("exhausted")
                 or result.signals.get("blocked")):
-            if result.signals.get("tool_failed"):
+            code = "tool_failed"
+            if result.signals.get("tool_failed") == "model":
+                # The model itself failed (transport error, unavailable adapter) — the one failure the
+                # ladder can't climb past (every retry needs the model). Surface the underlying error
+                # text so the owner sees WHAT broke, not just that a step "failed repeatedly".
+                code, reason = "model_error", (result.text or "the model call failed")
+            elif result.signals.get("tool_failed"):
                 reason = f"tool '{result.signals.get('tool_failed')}' failed repeatedly"
             elif result.signals.get("blocked"):
                 reason = result.text or "the step could not be completed"
@@ -585,7 +675,7 @@ class Operator:
             step.status = StepStatus.FAILED
             step.result = result
             self.store.save_plan(run.run_id, plan)
-            self._escalate(run, f"step {step.index + 1} could not complete: {reason}")
+            self._escalate(run, f"step {step.index + 1} could not complete: {reason}", reason_code=code)
             return "escalated"
 
         gate = self._gate_step(run, step, result, self._sandbox(run.run_id))
@@ -660,11 +750,15 @@ class Operator:
         run.dag_replans += 1
         self.store.save_run(run)   # count the attempt BEFORE replanning so a crash mid-replan can't loop
         done_steps = [s for s in plan.steps if s.status is StepStatus.DONE]   # FAILED step intentionally excluded
+        new_info = ("That route is exhausted. Re-architect the REMAINING work with a DIFFERENT approach, "
+                    "tool, or contact that does NOT repeat the failed step; keep all completed work.")
+        notes = self.store.take_notes(run.run_id)   # mid-drive owner guidance steers the re-architecture
+        if notes:
+            new_info = "THE OWNER SAID (mid-run): " + "; ".join(notes) + "\n" + new_info
         newplan = self.planner.replan(
             goal, done_steps,
             reason=f'step {step.index + 1} "{step.text}" could not be completed: {reason}',
-            new_info="That route is exhausted. Re-architect the REMAINING work with a DIFFERENT approach, "
-                     "tool, or contact that does NOT repeat the failed step; keep all completed work.",
+            new_info=new_info,
             broker=self._broker(run), catalog=CAPABILITY_CATALOG,
             memory=self.store.get_memory(run.tenant_id))
         if len(newplan.steps) <= len(done_steps):
@@ -1146,15 +1240,20 @@ class Operator:
         self._emit(run, "done", report)
         return run
 
-    def _escalate(self, run, reason: str):
+    def _escalate(self, run, reason: str, *, reason_code: str = ""):
+        """Park the run on the owner as a REVIEW question — an escalation is a parked conversation the
+        owner can answer to continue (see ``_resume_escalated``), never a dead end. ``reason_code`` is a
+        machine-readable tag (``model_error`` / ``budget_exhausted`` / ``owner_declined`` / ... ) riding
+        alongside the human text so the dashboard and tests can branch on WHY without parsing prose."""
         apr = ApprovalRequest(run_id=run.run_id, kind="review", prompt=reason, options=[])
         run.pending_approval = apr
         run.status = RunStatus.ESCALATED
         run.updated_at = now_ts()
-        self._release_run_resources(run)   # terminal-for-now: free the browser session (resume re-creates one)
+        self._release_run_resources(run)   # parked: free the browser session (a resume re-creates one)
         self.store.save_approval(apr)
         self.store.save_run(run)
-        self._emit(run, "escalated", reason)
+        extra = {"reason_code": reason_code} if reason_code else {}
+        self._emit(run, "escalated", reason, **extra)
 
     # ================================================================ helpers
     def _available_tools(self) -> list:
@@ -1201,6 +1300,9 @@ class Operator:
                       browser=self.browser, overrides=self.overrides,
                       mandate=mandate, mandate_counts=run.mandate_counts,
                       trust=self.store.get_trust(run.tenant_id), on_usage=on_usage,
+                      # Pre-call heartbeats -> ordinary progress events: the dashboard's timeline
+                      # animates DURING a long model/tool call instead of looking frozen for minutes.
+                      on_activity=lambda text: self._emit(run, "progress", f"step in progress — {text}"),
                       run_id=run.run_id, tenant_id=run.tenant_id,
                       verify_attempts=self.verify_attempts, verify_delay=self.verify_delay,
                       forwarded_gks=forwarded_gks)
@@ -1268,4 +1370,6 @@ class Operator:
             self.channel.emit({"run_id": run.run_id, "tenant_id": run.tenant_id,
                                "kind": kind, "text": text, **extra})
         except Exception:
-            pass
+            # Never let a channel failure break the run — but with a durable event log a dropped emit
+            # is data loss, so it must at least leave a trace in the server log.
+            _log.exception("emit failed for run %s kind %s", run.run_id, kind)

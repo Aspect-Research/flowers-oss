@@ -44,6 +44,11 @@ class ControlPlane:
         """A watched/awaited external reply arrived: resume the parked run to CHECK (not a deadline)."""
         return self.operator.resume(run_id, event="reply")
 
+    def fail_run(self, run_id: str, reason: str) -> None:
+        """Record an unexpected drive failure as an honest ESCALATED outcome — a crashed background
+        drive must never leave a run silently stuck RUNNING (spinner-forever on the dashboard)."""
+        self.operator.fail(run_id, reason)
+
     def stalled_run_ids(self) -> list[str]:
         """The run-ids of crash orphans (RUNNING/PLANNING) — a fast SQL read, no re-drive. Snapshot these
         at startup BEFORE serving so the "a RUNNING run is a crash orphan" invariant holds (captured before
@@ -84,7 +89,7 @@ class ControlPlane:
                 resumed.append(self.operator.resume(timer.run_id, event="timer"))
             except Exception:
                 # Per-run isolation: a single malformed/poisoned run must NEVER abort the whole due-batch —
-                # the other tenants' timers were already claimed (fired) by due(), so an uncaught exception
+                # the other runs' timers were already claimed (fired) by due(), so an uncaught exception
                 # here would silently drop them. Quarantine the bad run (it stays parked) and keep going,
                 # but log it so the failure is visible rather than silently swallowed.
                 _log.exception("tick: resume failed for run %s", timer.run_id)

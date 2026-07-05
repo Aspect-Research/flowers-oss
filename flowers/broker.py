@@ -128,6 +128,7 @@ class Broker:
         trust: dict | None = None,
         trust_threshold: int = mandate_lib.LEARNED_TRUST_THRESHOLD,
         on_usage: Callable[..., None] | None = None,
+        on_activity: Callable[[str], None] | None = None,
         actor: str = "executor",
         run_id: str = "",
         tenant_id: str = "",
@@ -152,6 +153,7 @@ class Broker:
         self.trust = trust or {}
         self.trust_threshold = trust_threshold
         self.on_usage = on_usage
+        self.on_activity = on_activity
         self.actor = actor
         self.run_id = run_id
         self.tenant_id = tenant_id
@@ -175,11 +177,23 @@ class Broker:
         if self.on_usage:
             self.on_usage(kind=kind, cost_usd=cost_usd, detail=detail)
 
+    def _activity(self, text: str) -> None:
+        """Best-effort PRE-call heartbeat: the broker is the one chokepoint that sees every long
+        provider call before it starts (a model call can block for minutes behind retries), so this is
+        where "the timeline is alive" progress comes from. Never raises, never blocks the call."""
+        if self.on_activity is None:
+            return
+        try:
+            self.on_activity(text)
+        except Exception:
+            pass
+
     # ---------------------------------------------------------------- model / search
     def complete(self, messages: list[dict], *, tools=None, role: str = "executor",
                  response_format=None, max_tokens=None) -> ModelResponse:
         if self.model is None:
             raise RuntimeError("broker has no model client wired")
+        self._activity("thinking…")
         resp = self.model.complete(messages, tools=tools, role=role,
                                    response_format=response_format, max_tokens=max_tokens)
         self._meter("model", resp.cost_usd, {"role": role})
@@ -188,6 +202,7 @@ class Broker:
     def search(self, query: str, *, k: int = 6) -> SearchResponse:
         if self.search_client is None:
             raise RuntimeError("broker has no search client wired")
+        self._activity(f"searching: {query[:80]}")
         self._meter("search", 0.0, {"query": query})
         return self.search_client.search(query, k=k)
 
@@ -282,6 +297,7 @@ class Broker:
         params = params or {}
         if policy.is_refused(toolkit, action):
             return self._refuse(toolkit=toolkit, action=action)
+        self._activity(f"calling {toolkit}:{action}")
         tier = policy.classify(toolkit, action, overrides=self.overrides)
         # WHETHER to verify a world effect comes from the NATURAL tier (not overridable): an owner's
         # auto override may waive the APPROVAL prompt, but never the independent read-back verification.
@@ -419,6 +435,7 @@ class Broker:
         if self.browser is None:
             raise RuntimeError("broker has no browser backend wired")
         params = params or {}
+        self._activity(f"browser: {action}")
         # The browser is the ONE place money can actually be spent. The spend event is a CLICK on a Pay /
         # Place-Order button — which is AUTO-tier by verb — and entering a card number via TYPE (also AUTO).
         # So the money gate runs UNCONDITIONALLY (NOT behind is_side_effecting, which would skip exactly the

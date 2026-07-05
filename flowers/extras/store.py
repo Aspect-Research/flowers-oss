@@ -67,6 +67,8 @@ class PostgresStore:
             CREATE TABLE IF NOT EXISTS effects (seq BIGSERIAL PRIMARY KEY, run_id TEXT NOT NULL, data JSONB NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals (approval_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, data JSONB NOT NULL, answer TEXT);
             CREATE TABLE IF NOT EXISTS usage_log (seq BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, cost_usd DOUBLE PRECISION NOT NULL, detail JSONB NOT NULL);
+            CREATE TABLE IF NOT EXISTS events (seq BIGSERIAL PRIMARY KEY, run_id TEXT NOT NULL, eid BIGINT NOT NULL, data JSONB NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_notes (seq BIGSERIAL PRIMARY KEY, run_id TEXT NOT NULL, text TEXT NOT NULL, consumed BOOLEAN NOT NULL DEFAULT FALSE);
             CREATE TABLE IF NOT EXISTS continuations (run_id TEXT PRIMARY KEY, data JSONB NOT NULL);
             CREATE TABLE IF NOT EXISTS user_memory (tenant_id TEXT PRIMARY KEY, content TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trust_counts (tenant_id TEXT PRIMARY KEY, data JSONB NOT NULL);
@@ -74,6 +76,8 @@ class PostgresStore:
             CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs((data->>'status'));
             CREATE INDEX IF NOT EXISTS idx_effects_run  ON effects(run_id, seq);
             CREATE INDEX IF NOT EXISTS idx_usage_run    ON usage_log(run_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_run_eid ON events(run_id, eid);
+            CREATE INDEX IF NOT EXISTS idx_notes_run    ON run_notes(run_id, consumed);
         """
         stmts = [s.strip() for s in ddl.split(";") if s.strip()]
         with self._pool.connection() as conn:
@@ -139,6 +143,46 @@ class PostgresStore:
             rows = conn.execute("SELECT data FROM effects WHERE run_id = %s ORDER BY seq",
                                 (run_id,)).fetchall()
             return [_effect_from_dict(r["data"]) for r in rows]
+
+    # --- events (the durable owner-facing per-run log the dashboard replays) ---
+    def append_event(self, run_id: str, event: dict) -> int:
+        """Same contract as SqliteStore.append_event: a per-run monotonic, gapless eid (the SSE
+        resume cursor). One transaction; the SELECT-then-INSERT races are resolved by the unique
+        (run_id, eid) index + Postgres serializing on it (a conflict retries once)."""
+        with self._pool.connection() as conn:
+            for _ in range(2):
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(eid), 0) + 1 AS n FROM events WHERE run_id = %s",
+                    (run_id,)).fetchone()
+                eid = int(row["n"])
+                try:
+                    conn.execute("INSERT INTO events (run_id, eid, data) VALUES (%s, %s, %s)",
+                                 (run_id, eid, self._Jsonb(dict(event))))
+                    return eid
+                except Exception:   # unique-index race with a concurrent emitter: recompute once
+                    conn.rollback()
+            raise RuntimeError(f"could not append event for run {run_id} (eid contention)")
+
+    def get_events(self, run_id: str, *, after: int = 0) -> list[dict]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT eid, data FROM events WHERE run_id = %s AND eid > %s ORDER BY eid",
+                (run_id, int(after))).fetchall()
+            return [{**r["data"], "id": r["eid"]} for r in rows]
+
+    # --- mid-run owner notes (messages that arrive while the run is driving) ---
+    def add_note(self, run_id: str, text: str) -> None:
+        with self._pool.connection() as conn:
+            conn.execute("INSERT INTO run_notes (run_id, text) VALUES (%s, %s)", (run_id, text))
+
+    def take_notes(self, run_id: str) -> list[str]:
+        """Return + mark-consumed atomically (one transaction, row-locked by the UPDATE)."""
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "UPDATE run_notes SET consumed = TRUE "
+                "WHERE run_id = %s AND consumed = FALSE RETURNING seq, text",
+                (run_id,)).fetchall()
+            return [r["text"] for r in sorted(rows, key=lambda r: r["seq"])]
 
     # --- approvals ---
     def save_approval(self, approval: ApprovalRequest) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -37,13 +38,17 @@ def _brain(steps, actions=None):
     return FakeModel(on_complete=fn)
 
 
+@contextlib.contextmanager
 def _client(model, *, integrations=None):
+    """Yield (client, store) with the TestClient ENTERED, so background drive tasks run on the
+    client's persistent portal loop instead of racing a per-request portal's shutdown."""
     store = SqliteStore()
-    ch = WebChannel()
+    ch = WebChannel(store)
     op = Operator(store=store, model=model, search=FakeSearch(),
                   integrations=integrations or FakeIntegrations(), timers=LocalTimers(), channel=ch)
     cp = ControlPlane(store=store, operator=op)
-    return TestClient(create_app(cp, ch)), store
+    with TestClient(create_app(cp, ch)) as client:
+        yield client, store
 
 
 def _settle(client, rid, *, want, timeout=5.0):
@@ -59,9 +64,9 @@ def _settle(client, rid, *, want, timeout=5.0):
 
 
 def test_index_serves_dashboard():
-    client, _ = _client(_brain([{"text": "noop"}]))
-    r = client.get("/")
-    assert r.status_code == 200 and "flowers" in r.text
+    with _client(_brain([{"text": "noop"}])) as (client, _):
+        r = client.get("/")
+        assert r.status_code == 200 and "flowers" in r.text
 
 
 def test_index_missing_asset_is_clear_500(monkeypatch):
@@ -69,49 +74,49 @@ def test_index_missing_asset_is_clear_500(monkeypatch):
     # an actionable JSON 500, not a stack trace or an import-time crash.
     import flowers.channels.web as web_mod
     monkeypatch.setattr(web_mod, "_dashboard_html", lambda: None)
-    client, _ = _client(_brain([{"text": "noop"}]))
-    r = client.get("/")
-    assert r.status_code == 500 and "reinstall" in r.json()["error"]
+    with _client(_brain([{"text": "noop"}])) as (client, _):
+        r = client.get("/")
+        assert r.status_code == 500 and "reinstall" in r.json()["error"]
 
 
 def test_post_goal_runs_and_logs_events():
     model = _brain([{"text": "write a brief"}],
                    {"write a brief": [ToolCall(name="write_file", args={"path": "b.md", "content": "x"})]})
-    client, _ = _client(model)
-    r = client.post("/api/goal", json={"identity": "web:u1", "text": "write a brief", "budget": 1.0})
-    assert r.status_code == 200
-    rid = r.json()["run_id"]
-    assert _settle(client, rid, want="done") == "done"
-    events = client.get(f"/api/runs/{rid}/events").json()["events"]
-    kinds = [e["kind"] for e in events]
-    assert "plan_announce" in kinds and "done" in kinds
+    with _client(model) as (client, _):
+        r = client.post("/api/goal", json={"identity": "web:u1", "text": "write a brief", "budget": 1.0})
+        assert r.status_code == 200
+        rid = r.json()["run_id"]
+        assert _settle(client, rid, want="done") == "done"
+        events = client.get(f"/api/runs/{rid}/events").json()["events"]
+        kinds = [e["kind"] for e in events]
+        assert "plan_announce" in kinds and "done" in kinds
 
 
 def test_approval_flow_over_http():
     model = _brain([{"text": "email the venue"}],
                    {"email the venue": [ToolCall(name="send_email",
                     args={"to": "bob@acme.com", "subject": "Venue inquiry"})]})
-    client, _ = _client(model)
-    rid = client.post("/api/goal", json={"identity": "web:u1", "text": "email the venue"}).json()["run_id"]
-    assert _settle(client, rid, want="awaiting_approval") == "awaiting_approval"
-    client.post("/api/answer", json={"run_id": rid, "text": "yes"})
-    assert _settle(client, rid, want="done") == "done"
+    with _client(model) as (client, _):
+        rid = client.post("/api/goal", json={"identity": "web:u1", "text": "email the venue"}).json()["run_id"]
+        assert _settle(client, rid, want="awaiting_approval") == "awaiting_approval"
+        client.post("/api/answer", json={"run_id": rid, "text": "yes"})
+        assert _settle(client, rid, want="done") == "done"
 
 
 def test_unknown_run_is_404():
-    client, _ = _client(_brain([{"text": "noop"}]))
-    assert client.get("/api/runs/nope").status_code == 404
+    with _client(_brain([{"text": "noop"}])) as (client, _):
+        assert client.get("/api/runs/nope").status_code == 404
 
 
 def test_sse_replay_streams_logged_events():
     model = _brain([{"text": "write a brief"}],
                    {"write a brief": [ToolCall(name="write_file", args={"path": "b.md", "content": "x"})]})
-    client, _ = _client(model)
-    rid = client.post("/api/goal", json={"identity": "web:u1", "text": "write a brief"}).json()["run_id"]
-    _settle(client, rid, want="done")   # let the background drive log its events before we replay
-    with client.stream("GET", f"/events/{rid}?replay_only=1") as r:
-        body = "".join(chunk for chunk in r.iter_text())
-    assert "event: plan_announce" in body and "event: done" in body
+    with _client(model) as (client, _):
+        rid = client.post("/api/goal", json={"identity": "web:u1", "text": "write a brief"}).json()["run_id"]
+        _settle(client, rid, want="done")   # let the background drive log its events before we replay
+        with client.stream("GET", f"/events/{rid}?replay_only=1") as r:
+            body = "".join(chunk for chunk in r.iter_text())
+        assert "event: plan_announce" in body and "event: done" in body
 
 
 def test_served_app_drives_the_timer_poller():
@@ -127,7 +132,7 @@ def test_served_app_drives_the_timer_poller():
             fired.set()
             return []
 
-    app = create_app(_CP(), WebChannel(), poll_interval=0.01)
+    app = create_app(_CP(), WebChannel(SqliteStore()), poll_interval=0.01)
     with TestClient(app):
         assert fired.wait(2.0), "the served app did not drive control_plane.tick()"
 
@@ -152,7 +157,7 @@ def test_startup_does_not_block_on_slow_crash_recovery():
         def tick(self):
             return []
 
-    app = create_app(_CP(), WebChannel(), poll_interval=0.01)
+    app = create_app(_CP(), WebChannel(SqliteStore()), poll_interval=0.01)
     t0 = time.monotonic()
     with TestClient(app):                       # would hang here if recovery blocked startup
         entered = time.monotonic() - t0
@@ -175,7 +180,7 @@ def test_no_poller_without_a_poll_interval():
             calls.append(1)
             return []
 
-    app = create_app(_CP(), WebChannel())
+    app = create_app(_CP(), WebChannel(SqliteStore()))
     with TestClient(app):
         time.sleep(0.1)
     assert calls == []

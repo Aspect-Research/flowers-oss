@@ -227,6 +227,19 @@ class Store(Protocol):
     def append_effect(self, run_id: str, effect: EffectRecord) -> None: ...
     def get_effects(self, run_id: str) -> list[EffectRecord]: ...
 
+    # --- events (the durable owner-facing per-run log the dashboard replays) ---
+    # append_event assigns and returns a per-run monotonic id (1-based, gapless) — the SSE resume
+    # cursor (Last-Event-ID). Durability is the point: a reconnecting client and a RESTARTED server
+    # replay the same timeline (the in-memory-only log was the "restart blanks the dashboard" bug).
+    def append_event(self, run_id: str, event: dict) -> int: ...
+    def get_events(self, run_id: str, *, after: int = 0) -> list[dict]: ...
+
+    # --- mid-run owner notes (messages that arrive while the run is driving) ---
+    # A durable queue, consumed atomically at the operator's next decision point. Notes are prompt
+    # CONTEXT only — they never mint grants or bypass the approval path.
+    def add_note(self, run_id: str, text: str) -> None: ...
+    def take_notes(self, run_id: str) -> list: ...        # -> list[str], marks them consumed
+
     # --- approvals ---
     def save_approval(self, approval) -> None: ...        # approval: flowers.types.ApprovalRequest
     # The read-side of save_approval. No product caller today (the operator resolves via
