@@ -1,8 +1,8 @@
 # STATUS — what's real vs. offline-fake
 
-flowers is an **experimental, unmaintained** reference project. This is an honest map of what actually
-works, what is a live adapter you must key in, and what is a deliberate no-op. Nothing here is a roadmap —
-there is no roadmap.
+This is an honest map of what actually works, what is a live adapter you must key in, and what is a
+deliberate no-op. flowers is maintained part-time with a deliberately small scope (see the maintenance
+note in the README) — treat this document as the ground truth of the current surface, not a roadmap.
 
 ## The trust core (the point) — real
 
@@ -49,9 +49,12 @@ escalates a run when hit (it never charges anyone).
 
 ## Surface
 
-One REST API (`flowers/channels/web.py`): `POST /api/goal`, `POST /api/answer`, `GET /api/runs/{id}`,
-`GET /events/{id}` (SSE), `/health`, `/ready`, plus a minimal HTML dashboard. It's a single-user local
-surface with **no auth** — run it on localhost. There are no phone/SMS/email-inbound channels in this release.
+One REST API (`flowers/channels/web.py`, reference in [`API.md`](API.md)): `POST /api/goal`,
+`POST /api/answer`, `GET /api/runs/{id}`, `GET /api/runs/{id}/events`, `GET /events/{id}` (SSE with
+durable ids + `Last-Event-ID` resume), `/health`, `/ready`, plus the chat dashboard at `/` (a static
+asset shipped in the package). Launched by the `flowers serve` console command (or
+`uvicorn flowers.app:app`). It's a single-user local surface with **no auth** — run it on localhost.
+There are no phone/SMS/email-inbound channels in this release.
 
 ## Connect
 
