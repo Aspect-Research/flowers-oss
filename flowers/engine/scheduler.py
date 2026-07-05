@@ -13,7 +13,7 @@ from dataclasses import dataclass
 @dataclass
 class SemanticBudget:
     """Per-step caps enforced ABOVE the hard dollar ceiling, so a run never reaches budget exhaustion
-    by thrashing. These are the numbers that would have bounded the earlier prototype's venue run."""
+    by thrashing (an unbounded executor can burn a whole budget re-searching the same dead end)."""
     max_iterations: int = 16          # executor tool-loop cap per step
     max_searches: int = 8             # searches per discovery step
     max_consecutive_failures: int = 2  # circuit-breaker threshold (per tool)

@@ -64,6 +64,16 @@ def test_index_serves_dashboard():
     assert r.status_code == 200 and "flowers" in r.text
 
 
+def test_index_missing_asset_is_clear_500(monkeypatch):
+    # The dashboard is package data; if it's missing (broken install), GET / must say so plainly —
+    # an actionable JSON 500, not a stack trace or an import-time crash.
+    import flowers.channels.web as web_mod
+    monkeypatch.setattr(web_mod, "_dashboard_html", lambda: None)
+    client, _ = _client(_brain([{"text": "noop"}]))
+    r = client.get("/")
+    assert r.status_code == 500 and "reinstall" in r.json()["error"]
+
+
 def test_post_goal_runs_and_logs_events():
     model = _brain([{"text": "write a brief"}],
                    {"write a brief": [ToolCall(name="write_file", args={"path": "b.md", "content": "x"})]})

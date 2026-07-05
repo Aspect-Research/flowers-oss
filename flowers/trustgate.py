@@ -1,7 +1,6 @@
 """The load-bearing trust gate — ONE deterministic decision core, no LLM anywhere in the path.
 
-Ported faithfully from an earlier prototype (the one piece of the prior system that was clean,
-correct, and the product's entire differentiator). It refuses to report "done" on a finish that
+This is the project's entire differentiator. It refuses to report "done" on a finish that
 rests on a stale read, a confirmed reliability signature, an unmet objective check, or an external
 effect the world does not actually reflect — *prevention*, mechanically, with no model in the trust
 path. Any advisory layer (an owner override or the autonomy mandate) may only ever make this stricter,

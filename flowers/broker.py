@@ -16,7 +16,6 @@ is built from an independent observation, never the executor's word.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import time
@@ -91,17 +90,6 @@ def _browser_spend_attempt(action: str, params: dict) -> bool:
         return True
     fills = p.get("fill") if isinstance(p.get("fill"), dict) else {}
     return any(_looks_like_card_number(v) for v in [p.get("text"), p.get("value"), *fills.values()])
-
-
-def _params_digest(params: dict) -> str:
-    """A stable short digest of the FULL action params — the binding for an authorization grant, so a
-    'yes' authorizes ONLY a byte-identical action (same recipient/subject/body/target), never a
-    different one that merely shares a toolkit/action or a partial semantic fingerprint."""
-    try:
-        blob = json.dumps(params or {}, sort_keys=True, default=str)
-    except Exception:
-        blob = repr(params)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -214,7 +202,7 @@ class Broker:
         (same recipient/subject/body/target), never every action of that toolkit and never a different
         target just because a partial semantic fingerprint is absent. Binding to the full params (not
         the read-back fingerprint) is what makes one 'yes' authorize exactly the action the owner saw."""
-        return f"{toolkit}:{action}|{_params_digest(params or {})}"
+        return f"{toolkit}:{action}|{mandate_lib.params_digest(params or {})}"
 
     def _mandate_covers(self, toolkit: str, action: str, params: dict, tier: str) -> bool:
         """Does the owner-approved mandate auto-authorize THIS action? A thin wrapper over the pure

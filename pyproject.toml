@@ -26,6 +26,11 @@ all = ["flowers[web,postgres,browser,dev]"]
 [tool.setuptools.packages.find]
 include = ["flowers*"]
 
+# The dashboard is a static asset inside the package (flowers/channels/static/index.html), loaded at
+# request time via importlib.resources — it must ship in both the wheel and the sdist.
+[tool.setuptools.package-data]
+"flowers.channels" = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

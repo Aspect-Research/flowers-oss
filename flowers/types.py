@@ -4,8 +4,7 @@ Deliberately pure stdlib (dataclasses + enums) so the trust contract has no heav
 single most important type here is :class:`EffectRecord` — the flat, serializable record of a
 world-touching action that the deterministic gate (``flowers.trustgate``) adjudicates. Integrations
 *produce* EffectRecords; the gate *consumes* them; the store *persists* them. Keeping its shape
-explicit (rather than an implicit dict assembled in three places, as in the prior system) is the public trust
-contract.
+explicit (rather than an implicit dict assembled in three places) is the public trust contract.
 """
 
 from __future__ import annotations
@@ -27,9 +26,8 @@ class RunStatus(enum.StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"  # parked on an ask/never-tier side-effect
     AWAITING_CONNECT = "awaiting_connect"    # parked needing the user to connect an account (OAuth)
     DONE = "done"
-    ESCALATED = "escalated"       # surfaced to the owner; not a silent quit, not a fabricated done
-    STOPPED = "stopped"           # honest, truthful stop (provably impossible)
-    FAILED = "failed"
+    ESCALATED = "escalated"       # parked on the owner: a review question they can answer to continue
+    STOPPED = "stopped"           # closed by the owner (e.g. declining to continue an escalated run)
 
 
 class StepStatus(enum.StrEnum):
@@ -74,6 +72,8 @@ class EffectRecord:
       * ``expected_present`` — did *this action's own* expected effect land (precise fingerprint)?
       * ``effect_kind`` — ``composio``/``comms``/``cua``/``filesystem``/... (drives provenance rules).
       * ``verification`` — set to ``"self_report"``/``"screenshot"`` for evidence that can NEVER verify.
+        No in-tree producer sets it today; it is deliberate contract surface for hand-built or external
+        records, and the gate's self-report guard is pinned by tests through this field.
       * ``observer`` / ``actor`` — identities; an observer equal to the actor is self-report.
 
     A record is built by the broker/integration layer from an INDEPENDENT read-back, never from the
@@ -197,9 +197,9 @@ class StepResult:
 @dataclass
 class ApprovalRequest:
     """A single owner-facing question the run parks on: clarifying questions, a side-effect to
-    authorize, a plan to approve (hard-gate), a budget/never-tier boundary."""
+    authorize, the autonomy-mandate card, an undo confirmation, or an escalation review."""
     run_id: str
-    kind: str                       # "clarify" | "side_effect" | "plan" | "budget" | "never"
+    kind: str                       # "clarify" | "side_effect" | "never" | "undo" | "mandate" | "review"
     prompt: str
     options: list[str] = field(default_factory=list)
     tier: str | None = None      # for side_effect/never: the policy tier

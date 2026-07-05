@@ -54,7 +54,7 @@ class Clarifier:
                  {"role": "user", "content": blob}],
                 role="planner", response_format=_QUESTIONS_RESPONSE_FORMAT)
             data = json.loads(resp.content)
-        except (TypeError, ValueError, Exception):
+        except Exception:
             return []
         qs = data.get("questions") if isinstance(data, dict) else None
         if not isinstance(qs, list):

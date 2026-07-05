@@ -1,0 +1,271 @@
+<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>flowers</title>
+<style>
+:root{--pink:#d6336c;--bg:#fafafa;--agent:#f0f0f3;--ink:#141414;--muted:#8a8a8a;--line:#e6e6e6}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);
+  display:flex;flex-direction:column;max-width:1040px;margin:0 auto;height:100vh}
+header{padding:.9rem 1rem;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:.6rem}
+#app{flex:1;display:flex;min-height:0}
+#status{width:272px;flex:none;border-right:1px solid var(--line);overflow-y:auto;padding:1rem .95rem;background:#fff}
+#main{flex:1;display:flex;flex-direction:column;min-width:0}
+#phase{font-size:.72rem;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:1rem}
+#phase .hi{color:var(--pink)}
+#timeline{list-style:none;margin:0;padding:0}
+.step{position:relative;padding:0 0 .95rem 1.55rem;color:var(--muted);font-size:.85rem;line-height:1.35}
+.step::before{content:'';position:absolute;left:4px;top:1rem;bottom:-.05rem;width:2px;background:var(--line)}
+.step:last-child::before{display:none}
+.step .dot{position:absolute;left:0;top:.18rem;width:11px;height:11px;border-radius:50%;background:#fff;
+  border:2px solid var(--line)}
+.step.done{color:#2b8a3e}
+.step.done .dot{background:#2b8a3e;border-color:#2b8a3e}
+.step.active{color:var(--ink);font-weight:600}
+.step.active .dot{border-color:var(--pink);background:var(--pink);animation:pulse 1.6s infinite}
+.step.waiting{color:#b8860b}
+.step.waiting .dot{border-color:#f2cf8a;background:#fff7e6}
+.step .sub{display:block;margin-top:.28rem;font-size:.76rem;font-weight:400;color:var(--muted);
+  overflow-wrap:anywhere}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(214,51,108,.45)}70%{box-shadow:0 0 0 6px rgba(214,51,108,0)}
+  100%{box-shadow:0 0 0 0 rgba(214,51,108,0)}}
+#tlempty{color:var(--muted);font-size:.82rem}
+@media(max-width:720px){#app{flex-direction:column}
+  #status{width:auto;max-height:32vh;border-right:0;border-bottom:1px solid var(--line)}}
+header h1{font-size:1.15rem;margin:0}
+header .sub{color:var(--muted);font-size:.82rem}
+#chat{flex:1;overflow-y:auto;padding:1rem;display:flex;flex-direction:column;gap:.55rem}
+.msg{max-width:80%;padding:.55rem .75rem;border-radius:15px;line-height:1.42;white-space:pre-wrap;
+  overflow-wrap:anywhere}
+.msg.agent{align-self:flex-start;background:var(--agent);white-space:normal}
+.msg.user{align-self:flex-end;background:var(--pink);color:#fff}
+.msg.agent .md>*{margin:.28rem 0}
+.msg.agent .md>*:first-child{margin-top:0}
+.msg.agent .md>*:last-child{margin-bottom:0}
+.msg.agent .md .h{font-weight:700}
+.msg.agent .md ul,.msg.agent .md ol{margin:.28rem 0;padding-left:1.2rem}
+.msg.agent .md li{margin:.12rem 0}
+.msg.agent .md a{color:var(--pink)}
+.msg.agent .md code{background:#0000000f;padding:0 .28rem;border-radius:4px;font-size:.92em}
+.msg .tag{font-size:.64rem;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);
+  margin-bottom:.2rem;font-weight:600}
+.msg.ask{background:#fff;border:1px solid var(--pink)}
+.msg.ask .tag{color:var(--pink)}
+.msg.done{background:#eefaf0;border:1px solid #bfe6c8}
+.msg.done .tag{color:#2b8a3e}
+.msg.escalated{background:#fff7e6;border:1px solid #f2cf8a}
+.msg.escalated .tag{color:#b8860b}
+.msg .link{display:inline-block;margin-top:.4rem;color:var(--pink);font-weight:600;text-decoration:none}
+.sys{align-self:center;color:var(--muted);font-size:.78rem;max-width:88%;text-align:center;white-space:pre-wrap}
+.sys.working::after{content:' ●';animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:.25}}
+#composer{border-top:1px solid var(--line);padding:.6rem .7rem;background:var(--bg)}
+#quick{display:flex;gap:.4rem;margin-bottom:.45rem}
+#quick:empty{display:none}
+.chip{border:1px solid var(--pink);background:var(--pink);color:#fff;border-radius:999px;
+  padding:.3rem .85rem;font-size:.85rem;cursor:pointer}
+.chip.ghost{background:#fff;color:var(--pink)}
+.row{display:flex;gap:.5rem;align-items:center}
+#msg{flex:1;padding:.6rem .7rem;border:1px solid var(--line);border-radius:11px;font:inherit;min-width:0}
+#send{background:var(--pink);color:#fff;border:0;border-radius:11px;padding:.6rem 1.1rem;font:inherit;
+  cursor:pointer}
+#send:disabled{opacity:.5;cursor:default}
+button{font:inherit}
+</style></head><body>
+<header><h1>🌸 flowers</h1><span class=sub>plans, works methodically, never claims what it can't verify</span></header>
+<div id=app>
+<aside id=status>
+  <div id=phase>Ready</div>
+  <ol id=timeline></ol>
+  <p id=tlempty>No active run yet — give it a goal.</p>
+</aside>
+<main id=main>
+<div id=chat></div>
+<div id=composer>
+  <div id=quick></div>
+  <div class=row>
+    <input id=msg placeholder="Give it a goal…" autocomplete=off>
+    <button id=send>Send</button>
+  </div>
+</div>
+</main>
+</div>
+<script>
+const KINDS=['plan_announce','progress','approval','clarify','notify','done','escalated','connect'];
+const TAG={plan_announce:'Plan',approval:'Needs your approval',clarify:'Question',
+  done:'Done',escalated:'Escalated',connect:'Connect',notify:''};
+const chat=document.getElementById('chat'), msg=document.getElementById('msg'),
+  quick=document.getElementById('quick'), send=document.getElementById('send');
+
+const phaseEl=document.getElementById('phase'), timeline=document.getElementById('timeline'),
+  tlempty=document.getElementById('tlempty');
+
+let rid=null, es=null, shown=0, terminal=false, busy=false;
+let steps=[], active=-1;
+
+// ---- left status panel: a live timeline parsed from the plan + progress events ----
+function setPhase(label,hi){
+  phaseEl.textContent=label;
+  if(hi){const s=document.createElement('span');s.className='hi';s.textContent=' '+hi;phaseEl.appendChild(s);}
+}
+function renderTimeline(){
+  timeline.innerHTML='';
+  steps.forEach(s=>{
+    const li=document.createElement('li'); li.className='step'+(s.state?(' '+s.state):'');
+    const dot=document.createElement('span'); dot.className='dot'; li.appendChild(dot);
+    li.appendChild(document.createTextNode(s.n+'. '+s.text));
+    if(s.state==='active' && s.sub){
+      const sub=document.createElement('span'); sub.className='sub'; sub.textContent=s.sub; li.appendChild(sub);
+    }
+    timeline.appendChild(li);
+  });
+  tlempty.style.display=steps.length?'none':'';
+}
+function resetTimeline(){steps=[];active=-1;renderTimeline();}
+function stepByN(n){return steps.find(s=>s.n===n);}
+function buildTimeline(text){
+  steps=[];
+  (text||'').split('\n').forEach(line=>{
+    const m=line.match(/^\s*(\d+)\.\s+(.+)$/);
+    if(m)steps.push({n:+m[1],text:m[2].replace(/\s\s+\(.+\)\s*$/,'').trim(),state:'pending'});
+  });
+  active=steps.length?steps[0].n:-1;
+  const first=stepByN(active); if(first)first.state='active';
+  renderTimeline(); phaseForActive();
+}
+function complete(n){
+  const s=stepByN(n); if(s){s.state='done';s.sub='';}
+  const nx=steps.find(x=>x.state==='pending'); active=nx?nx.n:-1; if(nx)nx.state='active';
+  renderTimeline();
+}
+function setWaiting(n){const s=stepByN(n); if(s){s.state='waiting';active=n;} renderTimeline();}
+function setSub(n,txt){const s=stepByN(n); if(s){if(s.state!=='waiting')s.state='active';s.sub=txt;} renderTimeline();}
+function phaseForActive(){
+  if(!steps.length)return;
+  const cur=stepByN(active);
+  if(cur && cur.state==='waiting')setPhase('Waiting');
+  else if(active>0)setPhase('Working ·','step '+active+' of '+steps.length);
+  else setPhase('Wrapping up');
+}
+function onProgress(text){
+  let m,handled=false;
+  if(m=text.match(/step (\d+) done/i)){complete(+m[1]);handled=true;}
+  else if(m=text.match(/recurring step (\d+) finished/i)){complete(+m[1]);handled=true;}
+  else if(m=text.match(/waiting on step (\d+)/i)){setWaiting(+m[1]);handled=true;}
+  if(!handled && active>0)setSub(active,text);
+  phaseForActive();
+}
+function allDone(){steps.forEach(s=>{if(s.state!=='done'){s.state='done';s.sub='';}});active=-1;renderTimeline();}
+
+function scroll(){chat.scrollTop=chat.scrollHeight;}
+// ---- minimal, ESCAPE-FIRST markdown (agent bodies may embed scraped text, so never trust it) ----
+function esc(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function mdInline(s){            // s is ALREADY escaped; only self-generated tags are introduced
+  s=s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
+  return s;
+}
+function mdToHtml(text){
+  const lines=esc(text||'').split('\n'); let html='',list='';
+  const close=()=>{if(list){html+='</'+list+'>';list='';}};
+  for(const line of lines){
+    let m;
+    if(m=line.match(/^\s*#{1,6}\s+(.*)$/)){close();html+='<div class=h>'+mdInline(m[1])+'</div>';}
+    else if(m=line.match(/^\s*[-*]\s+(.*)$/)){if(list!=='ul'){close();list='ul';html+='<ul>';}html+='<li>'+mdInline(m[1])+'</li>';}
+    else if(m=line.match(/^\s*\d+\.\s+(.*)$/)){if(list!=='ol'){close();list='ol';html+='<ol>';}html+='<li>'+mdInline(m[1])+'</li>';}
+    else if(!line.trim()){close();}
+    else{close();html+='<div>'+mdInline(line)+'</div>';}
+  }
+  close(); return html;
+}
+function bubble(side,kind,text,extra){
+  const w=document.createElement('div'); w.className='msg '+side+(kind?(' '+kind):'');
+  if(side==='agent' && kind && TAG[kind]){
+    const t=document.createElement('div'); t.className='tag'; t.textContent=TAG[kind]; w.appendChild(t);
+  }
+  const b=document.createElement('div');
+  if(side==='agent'){b.className='md'; b.innerHTML=mdToHtml(text);}   // agent prose -> escaped markdown
+  else{b.textContent=text;}                                          // user text -> always raw
+  w.appendChild(b);
+  if(kind==='connect' && extra && /^https?:/i.test(extra.url||'')){
+    const a=document.createElement('a'); a.className='link'; a.href=extra.url; a.target='_blank';
+    a.rel='noopener'; a.textContent='Connect '+(extra.provider||'account')+' →'; w.appendChild(a);
+  }
+  chat.appendChild(w); scroll(); return w;
+}
+function sys(text,cls){const s=document.createElement('div');s.className='sys'+(cls?(' '+cls):'');
+  s.textContent=text;chat.appendChild(s);scroll();return s;}
+let working=null;
+function showWorking(){if(!working)working=sys('working',' working');}
+function clearWorking(){if(working){working.remove();working=null;}}
+
+function setBusy(on){busy=on;send.disabled=on;}
+function clearQuick(){quick.innerHTML='';}
+function showApprove(){
+  clearQuick();
+  const y=document.createElement('button');y.className='chip';y.textContent='Approve';
+  y.onclick=()=>quickReply('yes');
+  const n=document.createElement('button');n.className='chip ghost';n.textContent='Decline';
+  n.onclick=()=>quickReply('no');
+  quick.appendChild(y);quick.appendChild(n);
+}
+function idle(){clearQuick();msg.placeholder='Give it a goal…';}
+function asking(kind){
+  if(kind==='approval'){showApprove();msg.placeholder='Approve, decline, or type a reply…';}
+  else{clearQuick();msg.placeholder='Type your answer…';}
+  msg.focus();
+}
+
+function render(k,d){
+  clearWorking();
+  const text=d.text||'';
+  if(k==='progress'){ if(steps.length)onProgress(text); else sys(text); return; }
+  if(k==='plan_announce'){bubble('agent',k,text);buildTimeline(text);return;}
+  if(k==='approval'||k==='clarify'){bubble('agent','ask',text);
+    const w=chat.lastChild;const t=document.createElement('div');t.className='tag';
+    t.textContent=TAG[k];w.insertBefore(t,w.firstChild);asking(k);setPhase('Waiting for you');return;}
+  if(k==='connect'){bubble('agent','connect',text,d);setPhase('Connect account');return;}
+  if(k==='done'||k==='escalated'){bubble('agent',k,text);terminal=true;closeStream();idle();
+    if(k==='done'){allDone();setPhase('Done','✓');}else setPhase('Escalated');return;}
+  bubble('agent',k,text);   // notify
+}
+
+function closeStream(){if(es){es.close();es=null;}}
+function connect(){
+  closeStream();
+  let idx=0; const cur=new EventSource('/events/'+rid); es=cur;
+  const handle=(k,e)=>{
+    if(es!==cur)return;
+    let d; try{d=JSON.parse(e.data);}catch(_){return;}
+    if(idx<shown){idx++;return;}           // skip events already rendered (replay after reconnect)
+    idx++; shown++; render(k,d);
+  };
+  KINDS.forEach(k=>cur.addEventListener(k,e=>handle(k,e)));
+  cur.onerror=()=>{cur.close();if(es===cur)es=null;
+    if(!terminal && rid){setTimeout(()=>{if(!es&&!terminal)connect();},700);}};
+}
+
+async function post(url,body){
+  return fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+}
+async function submit(){
+  const text=msg.value.trim(); if(busy||!text)return;
+  bubble('user',null,text); msg.value=''; clearQuick(); setBusy(true); showWorking();
+  try{
+    if(!rid||terminal){
+      terminal=false; shown=0; resetTimeline(); setPhase('Planning…');
+      const r=await post('/api/goal',{text});
+      const j=await r.json(); rid=j.run_id; connect();
+    }else{
+      const r=await post('/api/answer',{run_id:rid,text}); await r.json();
+      if(!es)connect();
+    }
+  }catch(_){clearWorking();sys('network error — is the server running?');}
+  finally{setBusy(false);msg.focus();}
+}
+function quickReply(v){if(busy)return;msg.value=v;submit();}
+
+send.onclick=submit;
+msg.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submit();}});
+msg.focus();
+</script></body></html>

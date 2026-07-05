@@ -62,9 +62,11 @@ _MAX_SCOPE = 128
 # --------------------------------------------------------------------------- small pure helpers
 
 def params_digest(params: dict) -> str:
-    """A stable short digest of the FULL action params — the dedupe key for a mandate-covered action, so
-    a byte-identical repeat is NOT auto-resent (a genuine resend is the owner's call). Same algorithm as
-    the broker's grant digest, kept here so the module has no import cycle on the broker."""
+    """A stable short digest of the FULL action params — the single definition used both as the dedupe
+    key for a mandate-covered action (a byte-identical repeat is NOT auto-resent; a genuine resend is
+    the owner's call) and as the binding for the broker's authorization grants (a 'yes' authorizes ONLY
+    a byte-identical action — same recipient/subject/body/target — never a different one that merely
+    shares a toolkit/action)."""
     try:
         blob = json.dumps(params or {}, sort_keys=True, default=str)
     except Exception:
