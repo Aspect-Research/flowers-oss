@@ -13,6 +13,7 @@ import json
 import threading
 import time
 
+from _harness import make_brain
 from starlette.testclient import TestClient
 
 from flowers.channels.web import WebChannel, create_app
@@ -25,8 +26,6 @@ from flowers.seams.search import FakeSearch
 from flowers.seams.store import SqliteStore
 from flowers.seams.timers import LocalTimers
 from flowers.types import Goal, Plan, PlanStep, RunStatus, ToolCall
-
-from _harness import make_brain
 
 
 @contextlib.contextmanager

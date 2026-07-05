@@ -5,4 +5,4 @@ refuses a claimed "done" resting on stale reads or on an external effect the wor
 reflect. Everything else attaches to that core.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"

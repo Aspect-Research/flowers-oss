@@ -1,7 +1,7 @@
-# Optional: run flowers locally in a container (the README quickstart just uses `uvicorn flowers.app:app`).
+# Optional: run flowers locally in a container (the README quickstart just uses `flowers serve`).
 #
-# Serves the ASGI app `flowers.app:app` (the single build_app() factory). Runs execute in-request and the
-# event log is per-process, so run it as a single worker.
+# Serves the ASGI app `flowers.app:app` (the single build_app() factory). One worker only: each
+# worker process would run its own timer poller + crash-recovery sweep against the same sqlite files.
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -27,6 +27,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"
 
-# Single worker. Pass your provider keys via the environment (`docker run --env-file .env ...`),
-# NOT baked into the image. There is no auth, so don't expose the published port to an untrusted network.
-CMD ["uvicorn", "flowers.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# The console script pins workers=1 itself. Pass your provider keys via the environment
+# (`docker run --env-file .env ...`), NOT baked into the image. There is no auth, so don't expose
+# the published port to an untrusted network.
+CMD ["flowers", "serve", "--host", "0.0.0.0", "--port", "8000"]

@@ -4,13 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowers"
-version = "0.0.1"
+version = "0.1.0"
 description = "A trustable agent with a deterministic, no-LLM verification gate."
 requires-python = ">=3.11"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = []
+keywords = ["agent", "llm", "ai-agents", "verification", "trust", "deterministic"]
+# no License:: classifier — the PEP 639 `license` expression above covers it, and setuptools>=77
+# deprecates mixing the two.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/asashepard/flowers"
+Issues = "https://github.com/asashepard/flowers/issues"
+
+[project.scripts]
+flowers = "flowers.cli:main"
 
 # Optional, environment-specific bindings. The core (engine + trust gate) depends on nothing but
 # the stdlib + sqlite3 so the offline test suite never needs the network. Real adapters live behind
@@ -38,9 +58,6 @@ filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
     "live: opt-in live-adapter test — collected only under FLOWERS_LIVE=1; run via `FLOWERS_LIVE=1 pytest -m live`",
 ]
-# pytest-asyncio is present in the global interpreter; pin its fixture loop scope to silence its
-# unset-default deprecation warning (flowers' own tests are synchronous).
-asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100
