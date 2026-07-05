@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import os
 
+# The single local user's identity, handed to per-user seams (the Arcade OAuth user, browser session
+# actor naming). flowers is a single-user, local tool — this constant is the one place that says so.
+LOCAL_USER = "local"
+
 
 def force_offline() -> bool:
     """True iff the suite/process has been pinned offline (no live model/tool/network calls)."""

@@ -1,9 +1,10 @@
 """Part III #5 — persistent browser contexts (logged-in sessions across runs).
 
-A Browserbase context id is stored per (tenant, site) in the durable, tenant-scoped Store and reused, so
-a one-time login survives across runs. Covers: the Store round-trip + tenant/site isolation + upsert;
-_ensure_context get-or-create (one create, then cache hits); per-tenant isolation (no credential bleed);
-the session body carries browserSettings.context only when a context exists; and the site key derivation.
+A Browserbase context id is stored per SITE in the durable Store and reused, so a one-time login
+survives across runs. Covers: the Store round-trip + site isolation (the security property: a
+context is only ever reused for the SAME site that created it — no credential bleed across sites) +
+upsert; _ensure_context get-or-create (one create, then cache hits); the session body carries
+browserSettings.context only when a context exists; and the site key derivation.
 All offline: _bb_request is monkeypatched, so no Browserbase network call.
 """
 
@@ -13,23 +14,22 @@ from flowers.seams import browser as browser_mod
 from flowers.seams.browser import BrowserbaseBrowser
 from flowers.seams.store import SqliteStore
 
-# --- the Store is the tenant-scoped context registry --------------------------------------------
+# --- the Store is the per-site context registry --------------------------------------------------
 
-def test_store_browser_context_roundtrip_and_isolation():
+def test_store_browser_context_roundtrip_and_site_isolation():
     s = SqliteStore(":memory:")
-    assert s.get_browser_context("t1", "acme.com") is None
-    s.save_browser_context("t1", "acme.com", "ctx_A")
-    assert s.get_browser_context("t1", "acme.com") == "ctx_A"
-    # site-scoped + tenant-scoped: a different site or tenant does NOT see it (no credential bleed)
-    assert s.get_browser_context("t1", "other.com") is None
-    assert s.get_browser_context("t2", "acme.com") is None
+    assert s.get_browser_context("acme.com") is None
+    s.save_browser_context("acme.com", "ctx_A")
+    assert s.get_browser_context("acme.com") == "ctx_A"
+    # site-scoped: a different site does NOT see it (no credential bleed across sites)
+    assert s.get_browser_context("other.com") is None
     # upsert: re-saving replaces (e.g. a re-seeded login)
-    s.save_browser_context("t1", "acme.com", "ctx_B")
-    assert s.get_browser_context("t1", "acme.com") == "ctx_B"
+    s.save_browser_context("acme.com", "ctx_B")
+    assert s.get_browser_context("acme.com") == "ctx_B"
     s.close()
 
 
-# --- _ensure_context: get-or-create, cached, tenant-isolated ------------------------------------
+# --- _ensure_context: get-or-create, cached, site-isolated ---------------------------------------
 
 class _CtxCounter:
     def __init__(self):
@@ -52,20 +52,20 @@ def test_ensure_context_creates_once_then_caches(monkeypatch):
     store = SqliteStore(":memory:")
     bb = _bb(store=store)
 
-    cid1 = bb._ensure_context("ten1", "acme.com")
+    cid1 = bb._ensure_context("acme.com")
     assert cid1 == "ctx_1" and counter.n == 1
-    # a second call for the SAME (tenant, site) reuses the stored context — no new create
-    assert bb._ensure_context("ten1", "acme.com") == "ctx_1" and counter.n == 1
-    # a DIFFERENT tenant gets its OWN context (no cross-tenant reuse)
-    assert bb._ensure_context("ten2", "acme.com") == "ctx_2" and counter.n == 2
+    # a second call for the SAME site reuses the stored context — no new create
+    assert bb._ensure_context("acme.com") == "ctx_1" and counter.n == 1
+    # a DIFFERENT site gets its OWN context (no credential bleed across sites)
+    assert bb._ensure_context("shop.io") == "ctx_2" and counter.n == 2
     store.close()
 
 
 def test_ensure_context_is_noop_without_store_or_site(monkeypatch):
     counter = _CtxCounter()
     monkeypatch.setattr(browser_mod, "_bb_request", counter)
-    assert _bb(store=None)._ensure_context("ten1", "acme.com") is None     # no store -> ephemeral
-    assert _bb(store=SqliteStore(":memory:"))._ensure_context("ten1", "") is None   # no site -> ephemeral
+    assert _bb(store=None)._ensure_context("acme.com") is None     # no store -> ephemeral
+    assert _bb(store=SqliteStore(":memory:"))._ensure_context("") is None   # no site -> ephemeral
     assert counter.n == 0
 
 

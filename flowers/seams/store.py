@@ -178,7 +178,6 @@ def _approval_from_dict(d: dict) -> ApprovalRequest:
 def _run_to_dict(r: RunState) -> dict:
     return {
         "run_id": r.run_id,
-        "tenant_id": r.tenant_id,
         "goal_text": r.goal_text,
         "budget_usd": r.budget_usd,
         "status": r.status.value,
@@ -198,7 +197,6 @@ def _run_from_dict(d: dict) -> RunState:
     pa = d.get("pending_approval")
     return RunState(
         run_id=d["run_id"],
-        tenant_id=d["tenant_id"],
         goal_text=d["goal_text"],
         budget_usd=d["budget_usd"],
         status=RunStatus(d.get("status", RunStatus.PENDING.value)),
@@ -250,15 +248,23 @@ class SqliteStore:
     def _init_tables(self) -> None:
         with self._locked() as c:
             self._create_tables(c)
+            # Pre-0.1 dbs carried a tenant_id column (multi-tenancy scaffolding, since removed).
+            # CREATE TABLE IF NOT EXISTS won't reshape an existing table, so fail loudly with the
+            # fix instead of a confusing NOT NULL error on the first insert. The .db files are
+            # gitignored dev artifacts — deleting them is safe.
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(runs)").fetchall()}
+            if "tenant_id" in cols:
+                raise RuntimeError(
+                    f"{self.path} was created by a pre-0.1 flowers build — delete it (and the "
+                    "timers db; both are local artifacts, safe to remove) and restart")
 
     @staticmethod
     def _create_tables(c) -> None:
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS runs (
-                run_id    TEXT PRIMARY KEY,
-                tenant_id TEXT NOT NULL,
-                data      TEXT NOT NULL
+                run_id TEXT PRIMARY KEY,
+                data   TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS plans (
                 run_id TEXT PRIMARY KEY,
@@ -276,12 +282,11 @@ class SqliteStore:
                 answer      TEXT
             );
             CREATE TABLE IF NOT EXISTS usage (
-                seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-                tenant_id TEXT NOT NULL,
-                run_id    TEXT NOT NULL,
-                kind      TEXT NOT NULL,
-                cost_usd  REAL NOT NULL,
-                detail    TEXT NOT NULL
+                seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id   TEXT NOT NULL,
+                kind     TEXT NOT NULL,
+                cost_usd REAL NOT NULL,
+                detail   TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS continuations (
                 run_id TEXT PRIMARY KEY,
@@ -307,19 +312,21 @@ class SqliteStore:
                 text     TEXT NOT NULL,
                 consumed INTEGER NOT NULL DEFAULT 0
             );
+            -- Single-user rows, honest in the schema (id pinned to 1) rather than hidden behind a
+            -- magic key: flowers has exactly one user, so memory and learned trust are singletons.
             CREATE TABLE IF NOT EXISTS user_memory (
-                tenant_id TEXT PRIMARY KEY,
-                content   TEXT NOT NULL
+                id      INTEGER PRIMARY KEY CHECK (id = 1),
+                content TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS trust_counts (
-                tenant_id TEXT PRIMARY KEY,
-                data      TEXT NOT NULL
+                id   INTEGER PRIMARY KEY CHECK (id = 1),
+                data TEXT NOT NULL
             );
+            -- Site-keyed (NOT user-keyed): the security property that matters is that a logged-in
+            -- browser context is only ever reused for the SAME site that created it.
             CREATE TABLE IF NOT EXISTS browser_contexts (
-                tenant_id  TEXT NOT NULL,
-                site       TEXT NOT NULL,
-                context_id TEXT NOT NULL,
-                PRIMARY KEY (tenant_id, site)
+                site       TEXT PRIMARY KEY,
+                context_id TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_effects_run   ON effects(run_id, seq);
             CREATE INDEX IF NOT EXISTS idx_usage_run     ON usage(run_id);
@@ -334,8 +341,8 @@ class SqliteStore:
     def create_run(self, run: RunState) -> None:
         with self._locked() as c:
             c.execute(
-                "INSERT INTO runs (run_id, tenant_id, data) VALUES (?, ?, ?)",
-                (run.run_id, run.tenant_id, json.dumps(_run_to_dict(run))),
+                "INSERT INTO runs (run_id, data) VALUES (?, ?)",
+                (run.run_id, json.dumps(_run_to_dict(run))),
             )
             c.commit()
 
@@ -350,17 +357,16 @@ class SqliteStore:
         """Upsert: update an existing run or insert if new (idempotent persistence)."""
         with self._locked() as c:
             c.execute(
-                "INSERT INTO runs (run_id, tenant_id, data) VALUES (?, ?, ?) "
-                "ON CONFLICT(run_id) DO UPDATE SET tenant_id = excluded.tenant_id, data = excluded.data",
-                (run.run_id, run.tenant_id, json.dumps(_run_to_dict(run))),
+                "INSERT INTO runs (run_id, data) VALUES (?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET data = excluded.data",
+                (run.run_id, json.dumps(_run_to_dict(run))),
             )
             c.commit()
 
-    def list_runs(self, tenant_id: str) -> list[RunState]:
+    def list_runs(self) -> list[RunState]:
+        """All runs, in creation order (a single-user store has no other scope)."""
         with self._locked() as c:
-            rows = c.execute(
-                "SELECT data FROM runs WHERE tenant_id = ? ORDER BY rowid", (tenant_id,)
-            ).fetchall()
+            rows = c.execute("SELECT data FROM runs ORDER BY rowid").fetchall()
         return [_run_from_dict(json.loads(r["data"])) for r in rows]
 
     def running_runs(self) -> list[RunState]:
@@ -496,13 +502,11 @@ class SqliteStore:
 
     # --- usage / metering ---
 
-    def record_usage(
-        self, *, tenant_id: str, run_id: str, kind: str, cost_usd: float, detail: dict
-    ) -> None:
+    def record_usage(self, *, run_id: str, kind: str, cost_usd: float, detail: dict) -> None:
         with self._locked() as c:
             c.execute(
-                "INSERT INTO usage (tenant_id, run_id, kind, cost_usd, detail) VALUES (?, ?, ?, ?, ?)",
-                (tenant_id, run_id, kind, float(cost_usd), json.dumps(dict(detail or {}))),
+                "INSERT INTO usage (run_id, kind, cost_usd, detail) VALUES (?, ?, ?, ?)",
+                (run_id, kind, float(cost_usd), json.dumps(dict(detail or {}))),
             )
             c.commit()
 
@@ -532,58 +536,53 @@ class SqliteStore:
             ).fetchone()
         return json.loads(row["data"]) if row is not None else None
 
-    # --- per-user memory (cross-session, self-curated markdown) ---
+    # --- user memory (cross-session, self-curated markdown; single-user singleton row) ---
 
-    def get_memory(self, tenant_id: str) -> str:
+    def get_memory(self) -> str:
         with self._locked() as c:
-            row = c.execute(
-                "SELECT content FROM user_memory WHERE tenant_id = ?", (tenant_id,)
-            ).fetchone()
+            row = c.execute("SELECT content FROM user_memory WHERE id = 1").fetchone()
         return row["content"] if row is not None else ""
 
-    def save_memory(self, tenant_id: str, content: str) -> None:
+    def save_memory(self, content: str) -> None:
         with self._locked() as c:
             c.execute(
-                "INSERT INTO user_memory (tenant_id, content) VALUES (?, ?) "
-                "ON CONFLICT(tenant_id) DO UPDATE SET content = excluded.content",
-                (tenant_id, content or ""),
+                "INSERT INTO user_memory (id, content) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+                (content or "",),
             )
             c.commit()
 
-    # --- learned-trust counters (per-user approval counts per action class) ---
+    # --- learned-trust counters (clean-approval counts per action class; singleton row) ---
 
-    def get_trust(self, tenant_id: str) -> dict:
+    def get_trust(self) -> dict:
         with self._locked() as c:
-            row = c.execute(
-                "SELECT data FROM trust_counts WHERE tenant_id = ?", (tenant_id,)
-            ).fetchone()
+            row = c.execute("SELECT data FROM trust_counts WHERE id = 1").fetchone()
         return json.loads(row["data"]) if row is not None else {}
 
-    def save_trust(self, tenant_id: str, counts: dict) -> None:
+    def save_trust(self, counts: dict) -> None:
         with self._locked() as c:
             c.execute(
-                "INSERT INTO trust_counts (tenant_id, data) VALUES (?, ?) "
-                "ON CONFLICT(tenant_id) DO UPDATE SET data = excluded.data",
-                (tenant_id, json.dumps(counts or {})),
+                "INSERT INTO trust_counts (id, data) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                (json.dumps(counts or {}),),
             )
             c.commit()
 
-    # --- persistent browser contexts (per (tenant, site) logged-in session profile) ---
+    # --- persistent browser contexts (per-site logged-in session profile) ---
 
-    def get_browser_context(self, tenant_id: str, site: str) -> str | None:
+    def get_browser_context(self, site: str) -> str | None:
         with self._locked() as c:
             row = c.execute(
-                "SELECT context_id FROM browser_contexts WHERE tenant_id = ? AND site = ?",
-                (tenant_id, site),
+                "SELECT context_id FROM browser_contexts WHERE site = ?", (site,)
             ).fetchone()
         return row["context_id"] if row is not None else None
 
-    def save_browser_context(self, tenant_id: str, site: str, context_id: str) -> None:
+    def save_browser_context(self, site: str, context_id: str) -> None:
         with self._locked() as c:
             c.execute(
-                "INSERT INTO browser_contexts (tenant_id, site, context_id) VALUES (?, ?, ?) "
-                "ON CONFLICT(tenant_id, site) DO UPDATE SET context_id = excluded.context_id",
-                (tenant_id, site, context_id),
+                "INSERT INTO browser_contexts (site, context_id) VALUES (?, ?) "
+                "ON CONFLICT(site) DO UPDATE SET context_id = excluded.context_id",
+                (site, context_id),
             )
             c.commit()
 

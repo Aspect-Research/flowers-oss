@@ -56,11 +56,11 @@ def test_format_for_prompt_empty_is_blank_then_present():
 
 def test_store_memory_roundtrip_and_default():
     s = SqliteStore()
-    assert s.get_memory("ten-x") == ""                               # unknown tenant -> empty, not error
-    s.save_memory("ten-x", "# mem\n- hello\n")
-    assert s.get_memory("ten-x") == "# mem\n- hello\n"
-    s.save_memory("ten-x", "# mem\n- updated\n")                     # upsert
-    assert s.get_memory("ten-x") == "# mem\n- updated\n"
+    assert s.get_memory() == ""                                      # empty store -> empty, not error
+    s.save_memory("# mem\n- hello\n")
+    assert s.get_memory() == "# mem\n- hello\n"
+    s.save_memory("# mem\n- updated\n")                              # upsert (singleton row)
+    assert s.get_memory() == "# mem\n- updated\n"
 
 
 # --- the engine seams ---------------------------------------------------------------------------
@@ -70,9 +70,9 @@ def test_remember_tool_persists_to_user_memory():
                        actions={"greet the user": [
                            tc("remember", note="The user prefers to be called Asa.")]})
     h = build(model=model)
-    run = h["op"].start(Goal(text="say hi", tenant_id="ten-1"))
+    run = h["op"].start(Goal(text="say hi"))
     assert run.status is RunStatus.DONE
-    assert "prefers to be called Asa" in h["store"].get_memory("ten-1")
+    assert "prefers to be called Asa" in h["store"].get_memory()
 
 
 def test_memory_is_injected_into_a_later_run():
@@ -92,8 +92,8 @@ def test_memory_is_injected_into_a_later_run():
                              finish_reason="tool_calls")
 
     h = build(model=FakeModel(on_complete=fn))
-    h["store"].save_memory("ten-2", memory.append_note("", "The user's partner is named Sam."))
-    run = h["op"].start(Goal(text="hello", tenant_id="ten-2"))
+    h["store"].save_memory(memory.append_note("", "The user's partner is named Sam."))
+    run = h["op"].start(Goal(text="hello"))
     assert run.status is RunStatus.DONE
     assert "partner is named Sam" in seen["exec_blob"]               # injected into execution
     assert "WHAT YOU KNOW ABOUT THIS USER" in seen["exec_blob"]
@@ -147,6 +147,6 @@ def test_fresh_user_adds_no_memory_noise():
                              finish_reason="tool_calls")
 
     h = build(model=FakeModel(on_complete=fn))
-    run = h["op"].start(Goal(text="hello", tenant_id="ten-fresh"))
+    run = h["op"].start(Goal(text="hello"))
     assert run.status is RunStatus.DONE
     assert "WHAT YOU KNOW ABOUT THIS USER" not in seen["exec_blob"]  # no empty section for a new user

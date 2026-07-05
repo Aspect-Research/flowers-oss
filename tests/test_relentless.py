@@ -183,7 +183,7 @@ def test_malformed_recurring_params_dont_crash_and_still_terminate():
 
 
 def test_tick_isolates_a_raising_run(monkeypatch):
-    # a single run whose resume() raises must NOT abort the whole tick() due-batch (cross-tenant isolation).
+    # a single run whose resume() raises must NOT abort the whole tick() due-batch (per-run isolation).
     timers = LocalTimers()
     h = build(model=make_brain(steps=_recurring({"interval_seconds": 100, "max_occurrences": 2})),
               timers=timers)
@@ -414,7 +414,7 @@ def test_dag_replans_round_trips_field_explicitly():
     from flowers.seams.store import _run_from_dict, _run_to_dict
     from flowers.types import RunState
 
-    run = RunState(run_id="r", tenant_id="t", goal_text="g", budget_usd=1.0, dag_replans=3)
+    run = RunState(run_id="r", goal_text="g", budget_usd=1.0, dag_replans=3)
     d = _run_to_dict(run)
     assert d["dag_replans"] == 3
     assert _run_from_dict(d).dag_replans == 3

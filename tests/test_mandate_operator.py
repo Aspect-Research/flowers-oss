@@ -33,7 +33,7 @@ _BATCH_ACTIONS = {
 
 
 def _goal(text="email the caterers for a quote about our party"):
-    return Goal(text=text, tenant_id="t1", budget_usd=5.0)
+    return Goal(text=text, budget_usd=5.0)
 
 
 # --------------------------------------------------------------------------- the card
@@ -149,7 +149,7 @@ def test_provenance_discovered_recipient_is_auto_admitted():
                "magnitude_caps": {"max_sends": 5, "per_domain": 5, "per_recipient": 2}}
     h = build(model=make_brain(steps=steps, actions=actions, mandate=mandate),
               search=FakeSearch(fetches={"bistro.com": page}), integrations=FakeIntegrations())
-    run = h["op"].start(Goal(text="get a catering quote", tenant_id="t1", budget_usd=5.0))
+    run = h["op"].start(Goal(text="get a catering quote", budget_usd=5.0))
     rid = run.run_id
     run = h["cp"].answer(run_id=rid, answer="yes")           # grant the (empty-scope) mandate
     assert run.status is RunStatus.DONE                      # the discovered chef was auto-emailed
@@ -174,7 +174,7 @@ def test_provenance_does_not_admit_off_domain_injected_recipient():
                "magnitude_caps": {"max_sends": 5, "per_domain": 5, "per_recipient": 2}}
     h = build(model=make_brain(steps=steps, actions=actions, mandate=mandate),
               search=FakeSearch(fetches={"bistro.com": page}), integrations=FakeIntegrations())
-    run = h["op"].start(Goal(text="get a quote", tenant_id="t1", budget_usd=5.0))
+    run = h["op"].start(Goal(text="get a quote", budget_usd=5.0))
     run = h["cp"].answer(run_id=run.run_id, answer="yes")
     assert run.status is RunStatus.AWAITING_APPROVAL          # off-domain injected recipient still asks
 
@@ -184,11 +184,11 @@ _CAL = {"add the pickup": [tc("integration", toolkit="googlecalendar",
 
 
 def test_learned_trust_seeded_auto_covers_in_operator():
-    # seed the per-tenant trust at threshold -> a non-delivering reversible action auto-covers (no prompt).
+    # seed the learned trust at threshold -> a non-delivering reversible action auto-covers (no prompt).
     h = build(model=make_brain(steps=[{"text": "add the pickup to my calendar"}], actions=_CAL),
               integrations=FakeIntegrations())
-    h["store"].save_trust("t1", {"googlecalendar:GOOGLECALENDAR_CREATE_EVENT": 5})
-    run = h["op"].start(Goal(text="add pickup", tenant_id="t1", budget_usd=5.0))
+    h["store"].save_trust({"googlecalendar:GOOGLECALENDAR_CREATE_EVENT": 5})
+    run = h["op"].start(Goal(text="add pickup", budget_usd=5.0))
     assert run.status is RunStatus.DONE                       # learned-covered, never asked
     effs = [e for e in h["store"].get_effects(run.run_id)
             if e.label == "googlecalendar:GOOGLECALENDAR_CREATE_EVENT"]
@@ -196,19 +196,19 @@ def test_learned_trust_seeded_auto_covers_in_operator():
 
 
 def test_approval_increments_learned_trust_and_send_is_never_learned():
-    # first time the class is unknown -> asks; a clean yes increments the per-tenant count.
+    # first time the class is unknown -> asks; a clean yes increments the learned-trust count.
     h = build(model=make_brain(steps=[{"text": "add the pickup to my calendar"}], actions=_CAL),
               integrations=FakeIntegrations())
-    run = h["op"].start(Goal(text="add pickup", tenant_id="t1", budget_usd=5.0))
+    run = h["op"].start(Goal(text="add pickup", budget_usd=5.0))
     assert run.status is RunStatus.AWAITING_APPROVAL
     h["cp"].answer(run_id=run.run_id, answer="yes")
-    assert h["store"].get_trust("t1").get("googlecalendar:GOOGLECALENDAR_CREATE_EVENT") == 1
+    assert h["store"].get_trust().get("googlecalendar:GOOGLECALENDAR_CREATE_EVENT") == 1
     # a SEND class, even at a high learned count, is never auto-covered (recipient-bearing).
-    h["store"].save_trust("t1", {"gmail:GMAIL_SEND_EMAIL": 99})
+    h["store"].save_trust({"gmail:GMAIL_SEND_EMAIL": 99})
     h2 = build(model=make_brain(steps=[{"text": "email someone"}],
                                 actions={"email someone": [tc("send_email", to="a@b.com", subject="s", body="x")]}),
                store=h["store"], integrations=FakeIntegrations())
-    run2 = h2["op"].start(Goal(text="email", tenant_id="t1", budget_usd=5.0))
+    run2 = h2["op"].start(Goal(text="email", budget_usd=5.0))
     assert run2.status is RunStatus.AWAITING_APPROVAL          # send still asks despite the learned count
 
 

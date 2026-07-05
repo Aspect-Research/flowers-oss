@@ -33,7 +33,7 @@ def _gate_for(effect):
 
 
 def _broker(integrations, **kw):
-    return Broker(integrations=integrations, run_id="run_1", tenant_id="t1", **kw)
+    return Broker(integrations=integrations, run_id="run_1", **kw)
 
 
 def test_side_effect_needs_approval_when_unauthorized():

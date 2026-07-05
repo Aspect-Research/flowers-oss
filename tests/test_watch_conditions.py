@@ -51,7 +51,7 @@ def test_fail_closed_on_empty_or_unknown():
 
 def test_malformed_numeric_bounds_fail_closed_never_raise():
     # model-authored junk bounds must NOT raise (a ValueError out of the single-threaded tick loop would
-    # abort the whole due-batch — a cross-tenant DoS). They fail closed (condition not met).
+    # abort the whole due-batch — a cross-run DoS). They fail closed (condition not met).
     assert _c("price $40", {"number_near": {"anchor": "$", "at_most": "fifty"}}) == []
     assert _c("price $40", {"number_near": {"anchor": "$", "at_most": None}}) == []
     assert _c("a a a", {"count": {"of": "a", "at_least": "two"}}) == []

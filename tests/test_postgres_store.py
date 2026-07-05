@@ -42,8 +42,7 @@ def store():
 
 
 def test_runs_plans_effects_approvals_usage_round_trip(store):
-    tenant = _uid("ten")
-    run = RunState(run_id=_uid("run"), tenant_id=tenant, goal_text="organize the offsite",
+    run = RunState(run_id=_uid("run"), goal_text="organize the offsite",
                    budget_usd=5.0, status=RunStatus.RUNNING)
     store.create_run(run)
     assert store.get_run(run.run_id) == run            # full typed fidelity
@@ -52,7 +51,7 @@ def test_runs_plans_effects_approvals_usage_round_trip(store):
     run.status = RunStatus.AWAITING_APPROVAL
     store.save_run(run)                                # upsert
     assert store.get_run(run.run_id) == run
-    assert any(r.run_id == run.run_id for r in store.list_runs(tenant))
+    assert any(r.run_id == run.run_id for r in store.list_runs())
 
     eff_a = EffectRecord(toolkit="gmail", action="GMAIL_SEND_EMAIL", side_effecting=True,
                          phase="forwarded", expected_present=True, label="gmail:GMAIL_SEND_EMAIL")
@@ -78,8 +77,8 @@ def test_runs_plans_effects_approvals_usage_round_trip(store):
     store.save_approval(appr)                          # re-save must NOT clobber the recorded answer
     assert store.get_answer(appr.id) == "yes"
 
-    store.record_usage(tenant_id=tenant, run_id=run.run_id, kind="model", cost_usd=0.50, detail={"role": "planner"})
-    store.record_usage(tenant_id=tenant, run_id=run.run_id, kind="model", cost_usd=0.25, detail={})
+    store.record_usage(run_id=run.run_id, kind="model", cost_usd=0.50, detail={"role": "planner"})
+    store.record_usage(run_id=run.run_id, kind="model", cost_usd=0.25, detail={})
     assert abs(store.run_spend(run.run_id) - 0.75) < 1e-9
 
 

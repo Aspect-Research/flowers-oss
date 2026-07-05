@@ -335,7 +335,7 @@ def test_escalated_resume_without_headroom_stays_parked():
     run, goal = cp.begin(goal_text="x", budget_usd=0.50)
     cp.drive(run, goal)
     assert store.get_run(run.run_id).status.value == "escalated"
-    store.record_usage(tenant_id="local", run_id=run.run_id, kind="model",
+    store.record_usage(run_id=run.run_id, kind="model",
                        cost_usd=1.00, detail={})   # the budget is now spent
     got = cp.answer(run_id=run.run_id, answer="keep going, try harder")
     assert got.status.value == "escalated"

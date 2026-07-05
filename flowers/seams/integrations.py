@@ -412,8 +412,9 @@ class ArcadeIntegrations:
     injects it. Gated by ``ARCADE_API_KEY`` + the offline switch. Accepts an injected ``client`` so the
     canonical->Arcade mapping and the read-back logic are unit-testable offline with a fake SDK.
 
-    The ``user_id`` is the run's tenant id; in Arcade "dev mode" that is your own Arcade account email,
-    so a single user can connect and dogfood their own Google account without extra setup.
+    The ``user_id`` is the fixed local-user identity (``flowers.runtime.LOCAL_USER`` — flowers is a
+    single-user tool); in Arcade "dev mode" that maps to your own Arcade account, so you can connect
+    and dogfood your own Google account without extra setup.
     """
 
     def __init__(self, *, client=None):

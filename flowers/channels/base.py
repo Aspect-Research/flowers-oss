@@ -1,6 +1,6 @@
 """The channel contract + the channel-agnostic answer parser.
 
-An outbound *event* is a plain dict the operator emits: ``{"run_id","tenant_id","kind","text", ...}``
+An outbound *event* is a plain dict the operator emits: ``{"run_id","kind","text", ...}``
 where ``kind`` is one of EVENT_KINDS. A channel renders it however it likes (SSE line, SMS, etc.).
 Inbound, a channel hands the control plane a goal (and later, answers) via the intake/answer entry
 points; there is no inbound wrapper type.

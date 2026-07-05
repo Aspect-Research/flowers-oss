@@ -123,7 +123,6 @@ class EffectRecord:
 class Goal:
     text: str
     budget_usd: float = 2.0
-    tenant_id: str = "local"
     run_id: str = field(default_factory=lambda: new_id("run"))
     constraints: dict = field(default_factory=dict)   # filled by the clarifier (budget/location/...)
     # Optional WALL-CLOCK budget: keep trying (relentlessly) for up to this many seconds. The operator
@@ -211,7 +210,6 @@ class ApprovalRequest:
 @dataclass
 class RunState:
     run_id: str
-    tenant_id: str
     goal_text: str
     budget_usd: float
     status: RunStatus = RunStatus.PENDING

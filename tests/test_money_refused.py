@@ -69,7 +69,7 @@ def test_money_action_never_reaches_done():
         actions={"pay the invoice": [tc("integration", toolkit="stripe", action="CREATE_PAYMENT",
                                         params={"amount": 50})]})
     h = build(model=brain)
-    run = h["op"].start(Goal(text="g", tenant_id="t"))
+    run = h["op"].start(Goal(text="g"))
     assert run.status is RunStatus.ESCALATED
     assert any(e.phase == "refused" for e in h["store"].get_effects(run.run_id))   # recorded, never landed
 
@@ -83,7 +83,7 @@ def test_money_attempt_is_logged_to_internal_telemetry():
         steps=[{"text": "pay it"}],
         actions={"pay it": [tc("integration", toolkit="stripe", action="CREATE_PAYMENT", params={})]})
     h = build(model=brain, tracer=tracer)
-    h["op"].start(Goal(text="g", tenant_id="t"))
+    h["op"].start(Goal(text="g"))
     assert any(s.name == "money_attempt_refused" for s in tracer.spans())
 
 

@@ -17,7 +17,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 
-from flowers import effects, memory, policy, replies, trustgate
+from flowers import effects, memory, policy, replies, runtime, trustgate
 from flowers import mandate as mandate_lib
 from flowers.broker import Broker
 from flowers.channels.base import parse_answer
@@ -191,7 +191,7 @@ class Operator:
         """Create + persist the run as PENDING and return it IMMEDIATELY, without driving. Lets a channel
         hand the run-id to the owner right away and drive in the background (via :meth:`run_pending`), so
         plan/progress events stream LIVE instead of arriving in a batch after a blocking synchronous run."""
-        run = RunState(run_id=goal.run_id, tenant_id=goal.tenant_id, goal_text=goal.text,
+        run = RunState(run_id=goal.run_id, goal_text=goal.text,
                        budget_usd=goal.budget_usd, status=RunStatus.PENDING)
         # Wall-clock relentlessness budget: convert the goal's max_runtime_s to an absolute deadline on the
         # INJECTABLE timer clock (deterministic in tests; real wall-clock in prod). The give-up sites keep
@@ -213,7 +213,7 @@ class Operator:
                                 "which flowers will not do.")
             return run
         questions = self.clarifier.clarify(goal, broker=self._broker(run),
-                                           memory=self.store.get_memory(run.tenant_id))
+                                           memory=self.store.get_memory())
         if questions:
             apr = ApprovalRequest(run_id=run.run_id, kind="clarify",
                                   prompt="Before I start, a couple of questions:\n- " + "\n- ".join(questions),
@@ -370,7 +370,7 @@ class Operator:
         run.status = RunStatus.PLANNING
         self.store.save_run(run)
         plan = self.planner.plan(goal, broker=self._broker(run), catalog=CAPABILITY_CATALOG,
-                                 memory=self.store.get_memory(run.tenant_id))
+                                 memory=self.store.get_memory())
         self.store.save_plan(run.run_id, plan)
         proposed = plan.mandate or {}     # the planner's proposed autonomy scope (rides on the plan)
         if self.announce_enabled:
@@ -443,9 +443,9 @@ class Operator:
         prior = [(s.text, s.result.text) for s in plan.steps
                  if s.status is StepStatus.DONE and s.result is not None]
         result = self.executor.run(step, plan=plan, goal=goal, broker=broker, sandbox=sandbox,
-                                   grants=grants, user_id=run.tenant_id, feedback=feedback, prior=prior,
+                                   grants=grants, user_id=runtime.LOCAL_USER, feedback=feedback, prior=prior,
                                    available_tools=self._available_tools(),
-                                   memory=self.store.get_memory(run.tenant_id), role=role)
+                                   memory=self.store.get_memory(), role=role)
         self._persist_mandate_counts(run, broker)
         return self._handle_step_result(run, goal, plan, step, result, allow_redirect=True)
 
@@ -461,7 +461,7 @@ class Operator:
         sandbox = self._sandbox(run.run_id)
         grants = self._grants.get(run.run_id, set())
         result = self.executor.resume(resume_state, broker=broker, sandbox=sandbox,
-                                      grants=grants, user_id=run.tenant_id)
+                                      grants=grants, user_id=runtime.LOCAL_USER)
         self._persist_mandate_counts(run, broker)
         # An approved-then-performed action that fails verification is surfaced honestly (no re-run/divergence).
         outcome = self._handle_step_result(run, goal, plan, step, result, allow_redirect=False)
@@ -503,7 +503,7 @@ class Operator:
             reason="the owner replied to the escalation",
             new_info=f"OWNER GUIDANCE: {ans}",
             broker=self._broker(run), catalog=CAPABILITY_CATALOG,
-            memory=self.store.get_memory(run.tenant_id))
+            memory=self.store.get_memory())
         if len(newplan.steps) <= len(done_steps):
             # The replan produced no new work — park again honestly rather than spin.
             self._escalate(run, "I couldn't turn that into a next step — can you rephrase what "
@@ -534,7 +534,7 @@ class Operator:
         meta = self._connect.get(run.run_id) or {}
         toolkit = meta.get("toolkit", "")
         authorize = getattr(self.integrations, "authorize", None)
-        _res = authorize(toolkit, run.tenant_id) if callable(authorize) else ("error", "", "")
+        _res = authorize(toolkit, runtime.LOCAL_USER) if callable(authorize) else ("error", "", "")
         status = _res[0]
         if status == "completed":
             self.timers.cancel_for_run(run.run_id)
@@ -619,8 +619,7 @@ class Operator:
         notes = [e.get("note") for e in (result.events or [])
                  if e.get("kind") == "remember" and e.get("note")]
         if notes:
-            self.store.save_memory(
-                run.tenant_id, memory.append_notes(self.store.get_memory(run.tenant_id), notes))
+            self.store.save_memory(memory.append_notes(self.store.get_memory(), notes))
 
         if result.signals.get("needs_auth"):
             # The step needs the USER to connect an account (OAuth). Park on CONNECT: stash the exact parked
@@ -760,7 +759,7 @@ class Operator:
             reason=f'step {step.index + 1} "{step.text}" could not be completed: {reason}',
             new_info=new_info,
             broker=self._broker(run), catalog=CAPABILITY_CATALOG,
-            memory=self.store.get_memory(run.tenant_id))
+            memory=self.store.get_memory())
         if len(newplan.steps) <= len(done_steps):
             return None   # no-progress: the model added no new steps -> don't loop; escalate honestly
         self.store.save_plan(run.run_id, newplan)
@@ -963,7 +962,7 @@ class Operator:
                         goal, done_steps, reason="no verified replies arrived in the window",
                         new_info="send the NEXT batch of outreach (a different/second contact) and wait again",
                         broker=self._broker(run), catalog=CAPABILITY_CATALOG,
-                        memory=self.store.get_memory(run.tenant_id))
+                        memory=self.store.get_memory())
                     self.store.save_plan(run.run_id, newplan)
                     self._emit(run, "progress",
                                f"no replies yet — sending the next batch (round {run.replans})")
@@ -1097,7 +1096,7 @@ class Operator:
             try:
                 br = self._broker(run).call_browser(action="extract",
                                                     params={"url": params.get("url", "")},
-                                                    user_id=run.tenant_id)
+                                                    user_id=runtime.LOCAL_USER)
                 text = (br.data or {}).get("text", "") if br.status == "ok" else ""
                 return "text", text, bool(br.status == "ok" and (text or "").strip())
             except Exception:
@@ -1106,7 +1105,7 @@ class Operator:
         # fail-closed on an empty match). A MONITOR inbox-watch ("tell me when an email from X arrives")
         # reads the same inbox.
         inbox = self.integrations.snapshot(toolkit="gmail", action="GMAIL_FETCH_EMAILS",
-                                           params={}, user_id=run.tenant_id) or {}
+                                           params={}, user_id=runtime.LOCAL_USER) or {}
         return "inbox", inbox, True
 
     def _condition_met(self, kind: str, observed, match: dict) -> list:
@@ -1204,7 +1203,7 @@ class Operator:
         br = self.browser
         if br is not None and hasattr(br, "close"):
             try:
-                br.close(user_id=run.tenant_id)
+                br.close(user_id=runtime.LOCAL_USER)
             except Exception:
                 pass
         sb = self._sandboxes.pop(run.run_id, None)
@@ -1266,7 +1265,7 @@ class Operator:
         Log it to OUR telemetry so we can monitor it; it is NEVER surfaced to the user — the agent is never
         SEEN to even consider spending money. Best-effort; never breaks the run."""
         try:
-            with self.tracer.span("money_attempt_refused", tenant_id=run.tenant_id, run_id=run.run_id,
+            with self.tracer.span("money_attempt_refused", run_id=run.run_id,
                                   label=getattr(eff, "label", "") or f"{eff.toolkit}:{eff.action}"):
                 pass
         except Exception:
@@ -1274,11 +1273,11 @@ class Operator:
 
     def _broker(self, run) -> Broker:
         def on_usage(*, kind, cost_usd, detail):
-            self.store.record_usage(tenant_id=run.tenant_id, run_id=run.run_id, kind=kind,
+            self.store.record_usage(run_id=run.run_id, kind=kind,
                                     cost_usd=cost_usd, detail=detail)
             # Emit a cost-bearing telemetry span per metered call, so a wired tracer (the optional
             # Langfuse adapter) can roll up cost per run; NoOp/Local make this ~free.
-            with self.tracer.span(kind, tenant_id=run.tenant_id, run_id=run.run_id,
+            with self.tracer.span(kind, run_id=run.run_id,
                                   **(detail or {})) as sp:
                 sp.add_cost(float(cost_usd or 0.0))
         # The EFFECTIVE mandate widens the frozen recipient_scope with provenance-admitted recipients
@@ -1299,11 +1298,11 @@ class Operator:
         return Broker(model=self.model, search=self.search, integrations=self.integrations,
                       browser=self.browser, overrides=self.overrides,
                       mandate=mandate, mandate_counts=run.mandate_counts,
-                      trust=self.store.get_trust(run.tenant_id), on_usage=on_usage,
+                      trust=self.store.get_trust(), on_usage=on_usage,
                       # Pre-call heartbeats -> ordinary progress events: the dashboard's timeline
                       # animates DURING a long model/tool call instead of looking frozen for minutes.
                       on_activity=lambda text: self._emit(run, "progress", f"step in progress — {text}"),
-                      run_id=run.run_id, tenant_id=run.tenant_id,
+                      run_id=run.run_id,
                       verify_attempts=self.verify_attempts, verify_delay=self.verify_delay,
                       forwarded_gks=forwarded_gks)
 
@@ -1317,10 +1316,10 @@ class Operator:
         tk, _, act = appr.effect_label.partition(":")
         if not act or mandate_lib.is_recipient_bearing(tk, act) or policy.is_refused(tk, act):
             return
-        counts = self.store.get_trust(run.tenant_id)
+        counts = self.store.get_trust()
         label = mandate_lib.trust_label(appr.effect_label)
         counts[label] = int(counts.get(label, 0)) + 1
-        self.store.save_trust(run.tenant_id, counts)
+        self.store.save_trust(counts)
 
     def _persist_mandate_counts(self, run, broker) -> None:
         """Persist the broker's hot magnitude counter back to RunState after a step, so the mandate's
@@ -1360,15 +1359,14 @@ class Operator:
         return self.store.get_answer(run.pending_approval.id)
 
     def _goal_of(self, run) -> Goal:
-        return Goal(text=run.goal_text, budget_usd=run.budget_usd, tenant_id=run.tenant_id,
+        return Goal(text=run.goal_text, budget_usd=run.budget_usd,
                     run_id=run.run_id)
 
     def _emit(self, run, kind: str, text: str, **extra):
         if self.channel is None:
             return
         try:
-            self.channel.emit({"run_id": run.run_id, "tenant_id": run.tenant_id,
-                               "kind": kind, "text": text, **extra})
+            self.channel.emit({"run_id": run.run_id, "kind": kind, "text": text, **extra})
         except Exception:
             # Never let a channel failure break the run — but with a durable event log a dropped emit
             # is data loss, so it must at least leave a trace in the server log.

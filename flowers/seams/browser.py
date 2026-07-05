@@ -233,7 +233,7 @@ class BrowserbaseBrowser:
         self._session_timeout = max(60, min(int(session_timeout), 21600))  # Browserbase allows 60..21600s
         self._connect_timeout_ms = connect_timeout_ms
         self._pw = None
-        # Persistent-login support (#5): when a tenant-scoped ``context_store`` (a Store) is injected, a
+        # Persistent-login support (#5): when a ``context_store`` (a Store) is injected, a
         # session for (user_id, site) is created WITH the site's persistent Browserbase context, so a login
         # survives across runs. Actors are keyed by (user_id, site) so each site has its own logged-in
         # session; ``_current_site`` tracks the last-navigated host for url-less follow-up calls.
@@ -281,14 +281,14 @@ class BrowserbaseBrowser:
             raise RuntimeError(f"Browserbase /sessions returned no id/connectUrl: {_redact(str(s)[:200])}")
         return str(sid), str(curl)
 
-    def _ensure_context(self, tenant_id: str, site: str) -> str | None:
-        """Get-or-create the persistent Browserbase context for one (tenant, site). Cached in the injected
-        tenant-scoped ``context_store`` so the SAME context (its cookies/login) is reused across runs.
+    def _ensure_context(self, site: str) -> str | None:
+        """Get-or-create the persistent Browserbase context for one site. Cached in the injected
+        ``context_store`` so the SAME context (its cookies/login) is reused across runs.
         Returns None when no store is wired or no site is known (-> an ephemeral session, today's behaviour).
         Site-scoped: a context is only ever reused for the SAME site that created it (no credential bleed)."""
-        if not (self._context_store and tenant_id and site):
+        if not (self._context_store and site):
             return None
-        existing = self._context_store.get_browser_context(tenant_id, site)
+        existing = self._context_store.get_browser_context(site)
         if existing:
             return existing
         try:
@@ -298,7 +298,7 @@ class BrowserbaseBrowser:
         cid = (resp or {}).get("id")
         if not cid:
             return None
-        self._context_store.save_browser_context(tenant_id, site, str(cid))
+        self._context_store.save_browser_context(site, str(cid))
         return str(cid)
 
     @staticmethod
@@ -337,7 +337,7 @@ class BrowserbaseBrowser:
         key = (user_id, site)
         st = self._actors.get(key)
         if st is None:
-            context_id = self._ensure_context(user_id, site)   # persistent login for (tenant, site), if wired
+            context_id = self._ensure_context(site)   # persistent per-site login, if wired
             sid, curl = self._new_session(context_id)
             try:
                 browser, page = self._connect(curl)

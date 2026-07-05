@@ -131,7 +131,6 @@ class Broker:
         on_activity: Callable[[str], None] | None = None,
         actor: str = "executor",
         run_id: str = "",
-        tenant_id: str = "",
         verify_attempts: int = 1,
         verify_delay: float = 0.0,
         forwarded_gks: set | None = None,
@@ -156,7 +155,6 @@ class Broker:
         self.on_activity = on_activity
         self.actor = actor
         self.run_id = run_id
-        self.tenant_id = tenant_id
         # Verification read-back can retry for provider eventual-consistency (a just-sent email may
         # lag in Sent). Offline defaults to a single instant check (verify_attempts=1, no delay).
         self.verify_attempts = verify_attempts

@@ -86,7 +86,7 @@ def test_effect_landed_is_scoped_to_the_producing_step():
     (no step) keeps the legacy view for back-compat."""
     h = build(model=make_brain())
     op, store = h["op"], h["store"]
-    run = RunState(run_id="r1", tenant_id="t1", goal_text="x", budget_usd=2.0)
+    run = RunState(run_id="r1", goal_text="x", budget_usd=2.0)
     store.create_run(run)
     store.append_effect("r1", EffectRecord(
         toolkit="gmail", action="GMAIL_SEND_EMAIL", side_effecting=True, phase="forwarded",
@@ -113,7 +113,7 @@ def test_second_step_reissuing_an_approved_send_is_not_duplicated():
     actions = {"email the chef once": [tc("send_email", **_SEND)],
                "email the chef again (duplicate)": [tc("send_email", **_SEND)]}
     h = build(model=make_brain(steps=steps, actions=actions), integrations=integ)
-    run = h["op"].start(Goal(text="email the chef", tenant_id="local"))
+    run = h["op"].start(Goal(text="email the chef"))
     assert run.status is RunStatus.AWAITING_APPROVAL                   # step 0 parks for the ONE approval
     run = h["cp"].answer(run_id=run.run_id, answer="yes")
     assert run.status is RunStatus.DONE
@@ -132,7 +132,7 @@ def test_recover_stalled_redrives_a_crashed_running_run():
     steps = [{"text": "do the thing"}]
     actions = {"do the thing": []}                                     # a no-tool step that just finishes
     # Simulate a crash: a persisted run + plan left RUNNING, its step RUNNING, no timer scheduled.
-    run = RunState(run_id="r1", tenant_id="t1", goal_text="x", budget_usd=2.0, status=RunStatus.RUNNING)
+    run = RunState(run_id="r1", goal_text="x", budget_usd=2.0, status=RunStatus.RUNNING)
     store.create_run(run)
     store.save_plan("r1", Plan(steps=[PlanStep(index=0, text="do the thing", status=StepStatus.RUNNING)],
                                goal_text="x"))
@@ -151,7 +151,7 @@ def test_recover_stalled_escalates_a_planning_crash():
     surfaces honestly (ESCALATED) instead of hanging forever."""
     from flowers.seams.store import SqliteStore
     store = SqliteStore()
-    run = RunState(run_id="r1", tenant_id="t1", goal_text="x", budget_usd=2.0, status=RunStatus.PLANNING)
+    run = RunState(run_id="r1", goal_text="x", budget_usd=2.0, status=RunStatus.PLANNING)
     store.create_run(run)                                              # PLANNING, NO plan saved (crash mid-plan)
     h = build(model=make_brain(), store=store)
     recovered = h["cp"].recover_stalled()

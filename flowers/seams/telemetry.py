@@ -44,7 +44,7 @@ class NoOpTracer:
     def available(self) -> bool:
         return True
 
-    def span(self, name: str, *, tenant_id: str = "", run_id: str = "", **attrs) -> _NoOpSpan:
+    def span(self, name: str, *, run_id: str = "", **attrs) -> _NoOpSpan:
         return _NoOpSpan()
 
     def spans(self) -> list[Span]:
@@ -55,16 +55,15 @@ class NoOpTracer:
 
 class _LocalSpan:
     """A recording SpanHandle. Times itself across the ``with`` block and, on exit, appends a fully
-    populated :class:`Span` (name/tenant/run/attrs/cost/error/duration) to the owning tracer's list.
+    populated :class:`Span` (name/run/attrs/cost/error/duration) to the owning tracer's list.
 
     On exception inside the block it captures the formatted exception into ``error`` and RE-RAISES
     (``__exit__`` returns False).
     """
 
-    def __init__(self, tracer: LocalTracer, name: str, tenant_id: str, run_id: str, attrs: dict) -> None:
+    def __init__(self, tracer: LocalTracer, name: str, run_id: str, attrs: dict) -> None:
         self._tracer = tracer
         self.name = name
-        self.tenant_id = tenant_id
         self.run_id = run_id
         self.attributes: dict = dict(attrs)
         self.cost_usd: float = 0.0
@@ -104,8 +103,8 @@ class LocalTracer:
     def available(self) -> bool:
         return True
 
-    def span(self, name: str, *, tenant_id: str = "", run_id: str = "", **attrs) -> _LocalSpan:
-        return _LocalSpan(self, name, tenant_id, run_id, attrs)
+    def span(self, name: str, *, run_id: str = "", **attrs) -> _LocalSpan:
+        return _LocalSpan(self, name, run_id, attrs)
 
     def spans(self) -> list[Span]:
         return list(self._spans)
@@ -116,7 +115,6 @@ class LocalTracer:
         self._spans.append(
             Span(
                 name=handle.name,
-                tenant_id=handle.tenant_id,
                 run_id=handle.run_id,
                 attributes=attributes,
                 cost_usd=handle.cost_usd,

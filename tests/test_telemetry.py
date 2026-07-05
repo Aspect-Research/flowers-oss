@@ -18,7 +18,7 @@ def test_localtracer_records_name_ids_attrs_and_positive_duration():
     assert tracer.available() is True
     assert isinstance(tracer, Tracer)
 
-    with tracer.span("plan", tenant_id="t_1", run_id="r_1", phase="planning") as s:
+    with tracer.span("plan", run_id="r_1", phase="planning") as s:
         assert isinstance(s, SpanHandle)
         s.set(model="planner")
         # do a tiny bit of work so duration is measurably positive
@@ -26,7 +26,6 @@ def test_localtracer_records_name_ids_attrs_and_positive_duration():
 
     (recorded,) = tracer.spans()
     assert recorded.name == "plan"
-    assert recorded.tenant_id == "t_1"
     assert recorded.run_id == "r_1"
     assert recorded.attributes["phase"] == "planning"
     assert recorded.attributes["model"] == "planner"
@@ -36,7 +35,7 @@ def test_localtracer_records_name_ids_attrs_and_positive_duration():
 
 def test_localtracer_add_cost_accumulates_into_recorded_span():
     tracer = LocalTracer()
-    with tracer.span("exec", tenant_id="t_1", run_id="r_2") as s:
+    with tracer.span("exec", run_id="r_2") as s:
         s.add_cost(0.01)
         s.add_cost(0.02)
 
@@ -48,7 +47,7 @@ def test_localtracer_captures_exception_and_reraises():
     tracer = LocalTracer()
 
     with pytest.raises(ValueError, match="boom"):
-        with tracer.span("risky", tenant_id="t_1", run_id="r_3"):
+        with tracer.span("risky", run_id="r_3"):
             raise ValueError("boom")
 
     # the span was still recorded, with the exception captured into error
@@ -64,7 +63,7 @@ def test_noop_tracer_is_a_context_manager_and_records_nothing():
     assert tracer.available() is True
     assert isinstance(tracer, Tracer)
 
-    with tracer.span("anything", tenant_id="t_1", run_id="r_4") as s:
+    with tracer.span("anything", run_id="r_4") as s:
         assert isinstance(s, SpanHandle)
         s.set(foo="bar")
         s.add_cost(1.0)
@@ -92,7 +91,7 @@ def test_langfuse_span_is_a_safe_noop_when_unavailable():
     # offline, a span must NOT ship and must NOT raise — telemetry can never break a run.
     tracer = LangfuseTracer()
     assert tracer.available() is False
-    with tracer.span("model", tenant_id="t1", run_id="r1") as sp:
+    with tracer.span("model", run_id="r1") as sp:
         sp.set(role="planner")
         sp.add_cost(0.0123)
     assert sp.cost_usd == 0.0123

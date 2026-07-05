@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from flowers import runtime
 from flowers.controlplane import ControlPlane
 from flowers.engine.operator import Operator
 from flowers.seams.integrations import FakeIntegrations
@@ -45,7 +46,6 @@ def test_intake_creates_and_starts_a_run():
     cp, _store = _cp(model)
     run = cp.intake(goal_text="write a file", budget_usd=1.0)
     assert run.status is RunStatus.DONE
-    assert run.tenant_id == "local"   # single local user
 
 
 def test_tick_resumes_due_monitor_timer():
@@ -62,7 +62,7 @@ def test_tick_resumes_due_monitor_timer():
     cp.tick()
     assert store.get_run(run.run_id).status is RunStatus.WAITING
     # the email arrives; next due tick finds the verified match -> done
-    integ.deliver_inbound(run.tenant_id, sender="bank@chase.com", subject="loan", body="ok")
+    integ.deliver_inbound(runtime.LOCAL_USER, sender="bank@chase.com", subject="loan", body="ok")
     timers.advance(101)
     cp.tick()
     assert store.get_run(run.run_id).status is RunStatus.DONE

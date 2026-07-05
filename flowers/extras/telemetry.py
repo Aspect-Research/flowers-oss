@@ -3,7 +3,7 @@
 ``LangfuseTracer`` is an optional adapter template (not wired into the default ``build_app``; the wired
 defaults are ``NoOpTracer`` / ``LocalTracer`` in ``flowers/seams/telemetry.py``). It ships spans to
 Langfuse via the raw ingestion API (no SDK dependency — stdlib urllib). Each span becomes a Langfuse
-observation under a per-RUN trace, tagged ``tenant_id``/``run_id``. Gated on ``LANGFUSE_SECRET_KEY``
+observation under a per-RUN trace, tagged ``run_id``. Gated on ``LANGFUSE_SECRET_KEY``
 (unavailable offline). A telemetry ship failure NEVER breaks a run. To use this, swap it for the local
 tracer in ``build_app``.
 """
@@ -31,10 +31,9 @@ class _LangfuseSpan:
     + error, and on exit ships a per-run trace + this observation to Langfuse via the raw ingestion API.
     A ship failure is swallowed — telemetry must never break the run."""
 
-    def __init__(self, tracer: LangfuseTracer, name: str, tenant_id: str, run_id: str, attrs: dict) -> None:
+    def __init__(self, tracer: LangfuseTracer, name: str, run_id: str, attrs: dict) -> None:
         self._tracer = tracer
         self.name = name
-        self.tenant_id = tenant_id
         self.run_id = run_id
         self.attributes: dict = dict(attrs)
         self.cost_usd: float = 0.0
@@ -63,7 +62,7 @@ class _LangfuseSpan:
 class LangfuseTracer:
     """Optional Langfuse tracer — ships spans to Langfuse via the raw ingestion API (POST /api/public/ingestion,
     HTTP Basic ``public:secret``), NO SDK dependency (the stdlib core stays dep-free). Each span becomes
-    a Langfuse observation under a per-RUN trace, tagged ``tenant_id``/``run_id``; a span carrying cost
+    a Langfuse observation under a per-RUN trace, tagged ``run_id``; a span carrying cost
     is shipped as a ``generation-create`` with ``costDetails`` — the ONLY observation kind whose cost
     Langfuse rolls up (a plain span's cost is silently ignored). Gated on ``LANGFUSE_SECRET_KEY``
     (unavailable offline → the engine uses NoOp/Local). A telemetry ship failure NEVER breaks a run.
@@ -81,8 +80,8 @@ class LangfuseTracer:
     def available(self) -> bool:
         return runtime.adapter_available(key_env=self.KEY_ENV)
 
-    def span(self, name: str, *, tenant_id: str = "", run_id: str = "", **attrs) -> _LangfuseSpan:
-        return _LangfuseSpan(self, name, tenant_id, run_id, attrs)
+    def span(self, name: str, *, run_id: str = "", **attrs) -> _LangfuseSpan:
+        return _LangfuseSpan(self, name, run_id, attrs)
 
     def spans(self) -> list[Span]:
         return []   # live spans live in Langfuse, not buffered here
@@ -98,7 +97,7 @@ class LangfuseTracer:
             start, end = _iso(h._start or now), _iso(h._end or now)
             obs = {"id": new_id("obs"), "traceId": self.trace_id_for(h.run_id), "name": h.name,
                    "startTime": start, "endTime": end,
-                   "metadata": {"tenant_id": h.tenant_id, "run_id": h.run_id, **h.attributes}}
+                   "metadata": {"run_id": h.run_id, **h.attributes}}
             if h.error:
                 obs["level"] = "ERROR"
                 obs["statusMessage"] = h.error[:500]
@@ -111,7 +110,7 @@ class LangfuseTracer:
             batch = {"batch": [
                 {"id": new_id("evt"), "type": "trace-create", "timestamp": start,
                  "body": {"id": self.trace_id_for(h.run_id), "name": "flowers run " + (h.run_id or ""),
-                          "userId": h.tenant_id or None, "metadata": {"tenant_id": h.tenant_id}}},
+                          "userId": None, "metadata": {}}},
                 {"id": new_id("evt"), "type": obs_type, "timestamp": end, "body": obs},
             ]}
             auth = base64.b64encode(f"{self._public}:{self._secret}".encode()).decode()

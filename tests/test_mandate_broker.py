@@ -24,7 +24,7 @@ _MANDATE = {
 
 
 def _broker(integrations, *, mandate=None, **kw):
-    return Broker(integrations=integrations, run_id="run_1", tenant_id="t1", mandate=mandate, **kw)
+    return Broker(integrations=integrations, run_id="run_1", mandate=mandate, **kw)
 
 
 def _gate_for(effect):
@@ -166,7 +166,7 @@ def test_undo_window_off_by_default_forwards_immediately():
 
 
 def test_learned_trust_auto_covers_non_delivering_class():
-    b = Broker(integrations=FakeIntegrations(), run_id="r", tenant_id="t",
+    b = Broker(integrations=FakeIntegrations(), run_id="r",
                trust={"googlecalendar:GOOGLECALENDAR_CREATE_EVENT": 5}, trust_threshold=5)
     res = b.call_integration(toolkit="googlecalendar", action="GOOGLECALENDAR_CREATE_EVENT",
                              params={"summary": "Pickup"}, user_id="u")
@@ -175,7 +175,7 @@ def test_learned_trust_auto_covers_non_delivering_class():
 
 
 def test_learned_trust_below_threshold_still_parks():
-    b = Broker(integrations=FakeIntegrations(), run_id="r", tenant_id="t",
+    b = Broker(integrations=FakeIntegrations(), run_id="r",
                trust={"googlecalendar:GOOGLECALENDAR_CREATE_EVENT": 4}, trust_threshold=5)
     res = b.call_integration(toolkit="googlecalendar", action="GOOGLECALENDAR_CREATE_EVENT",
                              params={"summary": "Pickup"}, user_id="u")
@@ -183,7 +183,7 @@ def test_learned_trust_below_threshold_still_parks():
 
 
 def test_learned_trust_never_covers_a_delivering_send():
-    b = Broker(integrations=FakeIntegrations(), run_id="r", tenant_id="t",
+    b = Broker(integrations=FakeIntegrations(), run_id="r",
                trust={"gmail:GMAIL_SEND_EMAIL": 99}, trust_threshold=5)
     res = b.call_integration(toolkit="gmail", action="GMAIL_SEND_EMAIL",
                              params={"to": "x@y.com", "subject": "s"}, user_id="u")
@@ -193,7 +193,7 @@ def test_learned_trust_never_covers_a_delivering_send():
 def test_learned_trust_never_covers_event_with_external_attendees():
     # the HIGH regression: a learned calendar class with EXTERNAL attendees fans out invites -> must park,
     # never auto-cover. A personal event (no attendees) of the same class still auto-covers.
-    b = Broker(integrations=FakeIntegrations(), run_id="r", tenant_id="t",
+    b = Broker(integrations=FakeIntegrations(), run_id="r",
                trust={"googlecalendar:GOOGLECALENDAR_CREATE_EVENT": 9}, trust_threshold=5)
     invite = b.call_integration(toolkit="googlecalendar", action="GOOGLECALENDAR_CREATE_EVENT",
                                 params={"summary": "mtg", "attendees": ["attacker@evil.com"]}, user_id="u")
@@ -208,7 +208,7 @@ def test_learned_does_not_bypass_active_mandate_cap():
     # cap-rejected call of that class.
     mb = {"action_types": ["googlecalendar:GOOGLECALENDAR_CREATE_EVENT"], "recipient_scope": [],
           "magnitude_caps": {"max_sends": 1, "per_domain": 1, "per_recipient": 1}}
-    b = Broker(integrations=FakeIntegrations(), run_id="r", tenant_id="t", mandate=mb,
+    b = Broker(integrations=FakeIntegrations(), run_id="r", mandate=mb,
                trust={"googlecalendar:GOOGLECALENDAR_CREATE_EVENT": 9}, trust_threshold=5)
     first = b.call_integration(toolkit="googlecalendar", action="GOOGLECALENDAR_CREATE_EVENT",
                                params={"summary": "a"}, user_id="u")
@@ -223,7 +223,7 @@ def test_browser_book_off_scope_host_parks_under_mandate():
     # BOOK whose url is an off-scope host — the frozen scope binds the browser last-mile, not just SUBMIT.
     bm = {"action_types": ["browser:BOOK"], "recipient_scope": ["opentable.com"],
           "magnitude_caps": {"max_sends": 5, "per_domain": 5, "per_recipient": 5}}
-    b = Broker(browser=FakeBrowser(), run_id="r", tenant_id="t", mandate=bm)
+    b = Broker(browser=FakeBrowser(), run_id="r", mandate=bm)
     on = b.call_browser(action="BOOK", params={"url": "https://book.opentable.com/r/1"}, user_id="u")
     off = b.call_browser(action="BOOK", params={"url": "https://evil.com/r/9"}, user_id="u")
     assert on.status == "ok"                                  # in-scope host auto-authorized

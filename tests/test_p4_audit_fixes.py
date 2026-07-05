@@ -42,7 +42,7 @@ def test_empty_completion_with_no_evidence_is_refused():
     brain = _brain([{"text": "do the thing"}],
                    lambda msgs: ModelResponse(content="", finish_reason="stop"))
     h = build(model=brain)
-    run = h["op"].start(Goal(text="a goal", tenant_id="t"))
+    run = h["op"].start(Goal(text="a goal"))
     assert run.status is RunStatus.ESCALATED
 
 
@@ -53,7 +53,7 @@ def test_blank_finish_summary_is_refused():
                        tool_calls=[ToolCall(name="finish", args={"completed": True, "summary": "   "})],
                        finish_reason="tool_calls"))
     h = build(model=brain)
-    run = h["op"].start(Goal(text="a goal", tenant_id="t"))
+    run = h["op"].start(Goal(text="a goal"))
     assert run.status is RunStatus.ESCALATED
 
 
@@ -66,7 +66,7 @@ def test_real_deliverable_is_still_accepted():
                            "completed": True, "summary": "Here is the full writeup with all the details."})],
                        finish_reason="tool_calls"))
     h = build(model=brain)
-    run = h["op"].start(Goal(text="a goal", tenant_id="t"))
+    run = h["op"].start(Goal(text="a goal"))
     assert run.status is RunStatus.DONE
 
 
@@ -75,7 +75,7 @@ def test_file_producing_step_is_supported():
     brain = make_brain(steps=[{"text": "write a file"}],
                        actions={"write a file": [tc("write_file", path="out.txt", content="real output")]})
     h = build(model=brain)
-    run = h["op"].start(Goal(text="g", tenant_id="t"))
+    run = h["op"].start(Goal(text="g"))
     assert run.status is RunStatus.DONE
 
 
@@ -89,7 +89,7 @@ def test_identical_redo_is_refused_forgot_own_edit():
                        actions={"edit the file": [tc("write_file", path="out.txt", content="SAME"),
                                                   tc("write_file", path="out.txt", content="SAME")]})
     h = build(model=brain)
-    run = h["op"].start(Goal(text="g", tenant_id="t"))
+    run = h["op"].start(Goal(text="g"))
     assert run.status is RunStatus.ESCALATED
 
 
@@ -108,7 +108,7 @@ def test_deliverable_citing_an_unfetched_source_is_refused():
         steps=[{"text": "write report", "done_criteria": _SRC_CRIT}],
         actions={"write report": [tc("write_file", path="report.md", content=f"See {_URL} for details.")]})
     h = build(model=brain)
-    run = h["op"].start(Goal(text="g", tenant_id="t"))
+    run = h["op"].start(Goal(text="g"))
     assert run.status is RunStatus.ESCALATED
 
 
@@ -120,7 +120,7 @@ def test_deliverable_citing_a_fetched_source_is_accepted():
         actions={"write report": [tc("web_fetch", url=_URL),
                                   tc("write_file", path="report.md", content=f"See {_URL} for details.")]})
     h = build(model=brain)
-    run = h["op"].start(Goal(text="g", tenant_id="t"))
+    run = h["op"].start(Goal(text="g"))
     assert run.status is RunStatus.DONE
 
 
@@ -130,7 +130,7 @@ def test_run_shell_tool_executes_and_completes():
     brain = make_brain(steps=[{"text": "compute it"}],
                        actions={"compute it": [tc("run_shell", command="echo hello")]})
     h = build(model=brain)
-    run = h["op"].start(Goal(text="g", tenant_id="t"))
+    run = h["op"].start(Goal(text="g"))
     assert run.status is RunStatus.DONE
 
 
@@ -141,7 +141,7 @@ def test_failed_command_then_claimed_done_is_refused():
     brain = make_brain(steps=[{"text": "do compute"}],
                        actions={"do compute": [tc("run_shell", command="rm -rf /")]})
     h = build(model=brain)
-    run = h["op"].start(Goal(text="g", tenant_id="t"))
+    run = h["op"].start(Goal(text="g"))
     assert run.status is RunStatus.ESCALATED
 
 
@@ -151,7 +151,7 @@ def test_fetched_urls_survive_a_continuation_restart():
     # source_membership would falsely refuse a legitimate deliverable across a restart).
     h = build(model=make_brain())
     op, store = h["op"], h["store"]
-    store.create_run(RunState(run_id="r1", tenant_id="t", goal_text="g", budget_usd=1.0,
+    store.create_run(RunState(run_id="r1", goal_text="g", budget_usd=1.0,
                               status=RunStatus.RUNNING))
     op._fetched["r1"] = {"https://example.com/a"}
     op._grants["r1"] = {"gmail:GMAIL_SEND_EMAIL|deadbeef"}     # a parked run with a grant

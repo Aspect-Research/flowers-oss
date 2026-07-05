@@ -17,7 +17,7 @@ from flowers.types import EffectRecord, RunState, RunStatus
 
 
 def _run(rid: str) -> RunState:
-    return RunState(run_id=rid, tenant_id="local", goal_text="g", budget_usd=1.0,
+    return RunState(run_id=rid, goal_text="g", budget_usd=1.0,
                     status=RunStatus.RUNNING)
 
 
@@ -36,7 +36,7 @@ def test_store_survives_concurrent_threads(tmp_path):
                 store.save_run(_run(rid))
                 store.get_run(rid)
                 store.append_effect(rid, EffectRecord(toolkit="t", action="a"))
-                store.record_usage(tenant_id="local", run_id=rid, kind="model",
+                store.record_usage(run_id=rid, kind="model",
                                    cost_usd=0.001, detail={})
                 store.run_spend(rid)
                 store.running_runs()

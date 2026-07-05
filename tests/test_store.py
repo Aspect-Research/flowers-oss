@@ -2,7 +2,7 @@
 
 Pure persistence seam — no network, no ``available()``. These tests pin down round-trip
 fidelity (dataclasses + enums survive a write/read cycle), append ordering for effects,
-approval resolution, stable tenant identity, usage summing, and persistence across reopen.
+approval resolution, usage summing, and persistence across reopen.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ def test_run_round_trip_with_enum_status():
     s = _store()
     run = RunState(
         run_id="run_1",
-        tenant_id="ten_1",
         goal_text="book a table",
         budget_usd=5.0,
         status=RunStatus.PENDING,
@@ -40,7 +39,6 @@ def test_run_round_trip_with_enum_status():
     got = s.get_run("run_1")
     assert got is not None
     assert got.run_id == "run_1"
-    assert got.tenant_id == "ten_1"
     assert got.goal_text == "book a table"
     assert got.budget_usd == 5.0
     assert got.status is RunStatus.PENDING
@@ -75,7 +73,7 @@ def test_mandate_fields_round_trip(tmp_path):
                "irreversibility_ceiling": "ASK", "done_definition": "all emailed"}
     counts = {"sends_total": 2, "by_domain": {"acme.com": 2}, "by_recipient": {"a@acme.com": 2},
               "sent_digests": ["deadbeef"]}
-    run = RunState(run_id="run_m", tenant_id="t", goal_text="g", budget_usd=2.0,
+    run = RunState(run_id="run_m", goal_text="g", budget_usd=2.0,
                    mandate=mandate, mandate_counts=counts, deadline_ts=1782233000.5)
     s1.create_run(run)
     s1.save_plan("run_m", Plan(steps=[PlanStep(index=0, text="s")], goal_text="g", mandate=mandate))
@@ -88,7 +86,7 @@ def test_mandate_fields_round_trip(tmp_path):
     assert got.deadline_ts == 1782233000.5          # the wall-clock deadline round-trips too (Part II)
     assert s2.get_plan("run_m").mandate == mandate
     # a pre-mandate row (no fields) rehydrates to empty defaults, never a KeyError.
-    s2.create_run(RunState(run_id="run_old", tenant_id="t", goal_text="g", budget_usd=1.0))
+    s2.create_run(RunState(run_id="run_old", goal_text="g", budget_usd=1.0))
     old = s2.get_run("run_old")
     assert old.mandate == {} and old.mandate_counts == {}
     s2.close()
@@ -104,7 +102,6 @@ def test_run_with_pending_approval_round_trip():
     apr = ApprovalRequest(run_id="run_x", kind="side_effect", prompt="Send email?", tier="ask")
     run = RunState(
         run_id="run_x",
-        tenant_id="ten_x",
         goal_text="g",
         budget_usd=1.0,
         status=RunStatus.AWAITING_APPROVAL,
@@ -118,16 +115,15 @@ def test_run_with_pending_approval_round_trip():
     assert got.pending_approval.id == apr.id
 
 
-def test_list_runs_by_tenant():
+def test_list_runs_returns_all_in_creation_order():
     s = _store()
-    s.create_run(RunState(run_id="r1", tenant_id="A", goal_text="g1", budget_usd=1.0))
-    s.create_run(RunState(run_id="r2", tenant_id="A", goal_text="g2", budget_usd=1.0))
-    s.create_run(RunState(run_id="r3", tenant_id="B", goal_text="g3", budget_usd=1.0))
-    a = s.list_runs("A")
-    assert {r.run_id for r in a} == {"r1", "r2"}
-    assert all(isinstance(r, RunState) for r in a)
-    assert [r.run_id for r in s.list_runs("B")] == ["r3"]
-    assert s.list_runs("missing") == []
+    s.create_run(RunState(run_id="r1", goal_text="g1", budget_usd=1.0))
+    s.create_run(RunState(run_id="r2", goal_text="g2", budget_usd=1.0))
+    s.create_run(RunState(run_id="r3", goal_text="g3", budget_usd=1.0))
+    runs = s.list_runs()
+    assert [r.run_id for r in runs] == ["r1", "r2", "r3"]
+    assert all(isinstance(r, RunState) for r in runs)
+    assert SqliteStore().list_runs() == []
 
 
 def test_plan_round_trip_three_steps():
@@ -236,9 +232,9 @@ def test_approval_save_resolve_answer():
 
 def test_usage_spend_sums():
     s = _store()
-    s.record_usage(tenant_id="T", run_id="R1", kind="model", cost_usd=0.10, detail={"role": "planner"})
-    s.record_usage(tenant_id="T", run_id="R1", kind="search", cost_usd=0.05, detail={})
-    s.record_usage(tenant_id="T", run_id="R2", kind="model", cost_usd=0.20, detail={})
+    s.record_usage(run_id="R1", kind="model", cost_usd=0.10, detail={"role": "planner"})
+    s.record_usage(run_id="R1", kind="search", cost_usd=0.05, detail={})
+    s.record_usage(run_id="R2", kind="model", cost_usd=0.20, detail={})
 
     assert abs(s.run_spend("R1") - 0.15) < 1e-9
     assert abs(s.run_spend("R2") - 0.20) < 1e-9
@@ -253,7 +249,6 @@ def test_persistence_across_reopen(tmp_path):
     s1 = SqliteStore(db)
     run = RunState(
         run_id="run_persist",
-        tenant_id="ten_persist",
         goal_text="survive restart",
         budget_usd=3.0,
         status=RunStatus.RUNNING,
