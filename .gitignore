@@ -14,3 +14,5 @@ dist/
 venv/
 .claude/
 .live_send_await.json
+*.db-wal
+*.db-shm
