@@ -16,6 +16,7 @@ the broker, which takes the independent before/after read-back the trust gate ad
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -50,6 +51,26 @@ def _tick_seconds(*, default: float) -> float:
         return default
 
 
+def _role_config_from_env() -> dict[str, dict] | None:
+    """Optional model-routing override from ``FLOWERS_ROLE_CONFIG_JSON`` (a JSON map of role ->
+    {model, reasoning}, same shape as ``DEFAULT_ROLE_CONFIG``). Because role resolution falls back to
+    the ``executor`` entry, ``{"executor": {"model": "...", "reasoning": "low"}}`` reroutes EVERY role
+    — the one-line way to run flowers on a single (e.g. free) model. Invalid JSON logs a warning and
+    is ignored rather than crashing the app at import."""
+    raw = runtime.env("FLOWERS_ROLE_CONFIG_JSON")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        _log.warning("FLOWERS_ROLE_CONFIG_JSON is not valid JSON — using the default role config")
+        return None
+    if not isinstance(parsed, dict) or not all(isinstance(v, dict) for v in parsed.values()):
+        _log.warning("FLOWERS_ROLE_CONFIG_JSON must be a JSON object of role -> config — ignoring")
+        return None
+    return parsed
+
+
 def build_app(*, db_path: str = "flowers.db", timers_path: str = "flowers_timers.db"):
     """Assemble the flowers REST API on the minimal local substrate (the published default).
 
@@ -60,7 +81,7 @@ def build_app(*, db_path: str = "flowers.db", timers_path: str = "flowers_timers
     """
     store = SqliteStore(db_path)
     channel = WebChannel(store)   # events write through to the store: the log survives a restart
-    live_model = OpenRouterModel()
+    live_model = OpenRouterModel(role_config=_role_config_from_env())
     # With no model key, POST /api/goal must FAIL FAST with an actionable message — the wired FakeModel
     # has no scripted answers outside the test suite, so accepting a goal would let it die mid-run.
     # Everything else (the dashboard, /health, the event log) still serves at $0.

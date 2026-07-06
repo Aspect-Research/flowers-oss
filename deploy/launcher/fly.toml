@@ -1,0 +1,42 @@
+# Fly.io config for the flowers demo LAUNCHER (public). Deploy from the repo
+# root: flyctl deploy -c deploy/launcher/fly.toml
+#
+# Required secret: FLY_API_TOKEN — a deploy token scoped to the worker app
+# (flyctl tokens create deploy -a flowers-demo-workers), so the launcher can
+# create/destroy per-session worker machines.
+#
+# The launcher stays running while sessions exist (its reaper is the backstop
+# cleanup), but workers self-destruct on idle/max-age, so an auto-stopped
+# launcher cannot leak long-running machines.
+
+app = "flowers-demo"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  FLY_WORKER_APP = "flowers-demo-workers"
+  FLY_WORKER_IMAGE = "registry.fly.io/flowers-demo-workers:worker"
+  FLY_WORKER_REGION = "iad"
+  DEMO_ALLOWED_ORIGINS = "https://aspectresearch.org,http://localhost:3000"
+  DEMO_MAX_SESSIONS = "6"
+  DEMO_LAUNCHES_PER_HOUR_PER_IP = "3"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
