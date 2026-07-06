@@ -63,6 +63,28 @@ goal needs an account you haven't connected, the run parks, surfaces a consent l
 the durable tick, and resumes the exact pending action once connected. Arcade "dev mode" connects your own
 Google account; there is no multi-user verifier route in this release.
 
+## Known limitations (honest edges)
+
+An adversarial multi-agent review surfaced these; they are documented rather than hidden.
+
+- **Single process, by design.** Run exactly one worker (`flowers serve` / the Dockerfile pin
+  `workers=1`). The durable-timer claim and the per-run event-id assignment are atomic *within* a
+  process (a lock), not *across* processes — a second worker or a second `flowers` process on the
+  same sqlite files can double-fire a timer or drop a concurrent event id. Concurrency *within* the
+  one process (the tick poller, drive workers, SSE readers) is fully serialized and safe.
+- **The no-double-send guard is step-granular.** A verified side-effect is recorded when its step
+  settles, and crash recovery re-drives from that ledger. A process that dies in the sub-second
+  window *between* a provider send and the step's effect-persist could re-send that action on
+  recovery. Narrow, but real — the idempotency guarantee is "no duplicate across retries/replans/
+  restarts" with this one crash-window caveat.
+- **A resume that raises can orphan a WAITING run.** A due timer is marked fired before its run
+  resumes; if that resume raises (a bug), the timer won't re-fire and a WAITING run can stall. The
+  tick loop logs the failure so it's visible rather than silent.
+- **Provenance/SSRF edges.** Fetch-provenance records the requested URL (not the post-redirect
+  final URL), and the SSRF guard doesn't special-case exotic NAT64-embedded IPv4. Both require an
+  attacker-controlled redirect to matter and are low-severity; the redirect SSRF re-validation and
+  the same-host recipient-admission rule still bound the blast radius.
+
 ## Tests
 
 `pytest` runs the whole suite offline, at $0, with no keys and no network (enforced by the root

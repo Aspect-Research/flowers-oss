@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
 
     serve = sub.add_parser("serve", help="serve the dashboard + REST API (needs the [web] extra)")
     serve.add_argument("--host", default="127.0.0.1",
-                       help="bind address (default 127.0.0.1 — there is no auth; only expose "
+                       help="bind address (default 127.0.0.1; there is no auth, so only expose "
                             "beyond localhost on a network you trust)")
     serve.add_argument("--port", type=int, default=8000, help="port (default 8000)")
     serve.add_argument("--db", default="", help="path to the run-state sqlite db (FLOWERS_DB)")

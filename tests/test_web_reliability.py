@@ -467,3 +467,55 @@ def test_escalation_guidance_starting_with_no_is_not_a_stop():
     cp.drive(run2, goal2)
     assert store.get_run(run2.run_id).status.value == "escalated"
     assert cp.answer(run_id=run2.run_id, answer="no").status.value == "stopped"
+
+
+def test_concurrent_tick_and_answer_do_not_double_drive_a_parked_run():
+    # The per-run drive lock: a due timer (tick -> resume) and an owner answer (resume) hitting the
+    # SAME parked run at the same instant must not both drive it. We count how many times the parked
+    # AWAITING_APPROVAL run's approved action is executed — it must be exactly one, never two.
+    import threading as _t
+    sends = []
+    lock = _t.Lock()
+
+    def fn(messages, tools, role):
+        if role == "planner" and "intake step" in messages[0]["content"]:
+            return ModelResponse(content=json.dumps({"questions": []}))
+        if role == "planner":
+            return ModelResponse(content=json.dumps({"steps": [{"text": "email the venue"}]}))
+        user = messages[1]["content"]
+        n = sum(1 for m in messages if m.get("role") == "tool")
+        if "email the venue" in user and n == 0:
+            with lock:
+                sends.append(1)
+            return ModelResponse(tool_calls=[ToolCall(name="send_email",
+                                 args={"to": "bob@acme.com", "subject": "hi"})],
+                                 finish_reason="tool_calls")
+        return ModelResponse(tool_calls=[ToolCall(name="finish", args={"summary": "done"})],
+                             finish_reason="tool_calls")
+
+    store = SqliteStore()
+    ch = WebChannel(store)
+    op = Operator(store=store, model=FakeModel(on_complete=fn), search=FakeSearch(),
+                  integrations=FakeIntegrations(), timers=LocalTimers(), channel=ch)
+    cp = ControlPlane(store=store, operator=op)
+    run, goal = cp.begin(goal_text="venue")
+    cp.drive(run, goal)
+    assert store.get_run(run.run_id).status.value == "awaiting_approval"
+
+    # two threads race to resume the same parked run with the same approval
+    barrier = _t.Barrier(2)
+
+    def racer():
+        barrier.wait()
+        try:
+            cp.answer(run_id=run.run_id, answer="yes")
+        except Exception:
+            pass
+
+    threads = [_t.Thread(target=racer) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert store.get_run(run.run_id).status.value == "done"
+    assert len(sends) == 1, f"the approved send ran {len(sends)} times — double-drive!"

@@ -12,9 +12,12 @@ not re-run.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import tempfile
+import threading
+from collections import defaultdict
 from dataclasses import dataclass
 
 from flowers import effects, memory, policy, replies, runtime, trustgate
@@ -143,6 +146,13 @@ class Operator:
         self._connect: dict = {}         # run_id -> {toolkit,url,polls} for a parked-on-connect run
         self._fetched: dict = {}         # run_id -> set of URLs actually fetched (source_membership check)
         self._discovered: dict = {}      # run_id -> set of recipients admitted to scope by fetch-provenance
+        # Per-run drive mutex: the served app can enter a run from TWO threads at once — the tick
+        # poller (a due timer -> resume) and a request worker (an owner answer -> resume, or a fresh
+        # drive). Without exclusion they double-drive the same run: two concurrent step loops, a
+        # duplicate outreach batch, a racing send. An RLock (re-entrant within one thread, so the
+        # public entry point -> internal _drive nesting is fine) serializes drives per run_id.
+        self._run_locks: dict = defaultdict(threading.RLock)
+        self._run_locks_guard = threading.Lock()
 
     # ---- durable continuation (grants + parked resume-state survive a process restart) ----
     def _persist_continuation(self, run_id: str) -> None:
@@ -187,6 +197,14 @@ class Operator:
         if data.get("discovered"):
             self._discovered[run_id] = set(data["discovered"])
 
+    @contextlib.contextmanager
+    def _locked_run(self, run_id: str):
+        """Hold the per-run drive mutex. The tiny guarded lookup mints one RLock per run_id lazily."""
+        with self._run_locks_guard:
+            lock = self._run_locks[run_id]
+        with lock:
+            yield
+
     # ================================================================ entry points
     def begin(self, goal: Goal) -> RunState:
         """Create + persist the run as PENDING and return it IMMEDIATELY, without driving. Lets a channel
@@ -205,6 +223,10 @@ class Operator:
     def run_pending(self, run: RunState, goal: Goal) -> RunState:
         """Drive a just-``begin``-created run: screen -> clarify -> plan -> execute. Safe to run in a
         background thread; every event it emits streams to the channel as it happens."""
+        with self._locked_run(run.run_id):
+            return self._run_pending(run, goal)
+
+    def _run_pending(self, run: RunState, goal: Goal) -> RunState:
         # Illegal/disallowed-intent pre-screen: a goal asking for something illegal is hard-refused at
         # INTAKE — before any planning or model call — deterministically (no LLM in the refuse path). This
         # catches an illicit GOAL whose individual steps might each look benign (is_refused is action-scoped
@@ -229,6 +251,25 @@ class Operator:
         return self.run_pending(self.begin(goal), goal)
 
     def resume(self, run_id: str, *, answer: str | None = None, event: str | None = None) -> RunState:
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise KeyError(f"unknown run {run_id}")
+        # A message to a run that is actively DRIVING is handled WITHOUT the per-run drive lock: the
+        # drive thread holds that lock for the whole step, and the ack must be immediate, not blocked
+        # behind a minutes-long model call. add_note + _emit are each independently thread-safe (the
+        # store serializes its own writes), and a note is context-only — it can never mutate run state.
+        if (run.status in (RunStatus.RUNNING, RunStatus.PLANNING, RunStatus.PENDING)
+                and answer and answer.strip()):
+            self.store.add_note(run.run_id, answer.strip())
+            self._emit(run, "notify", "noted — I'm mid-task; I'll fold that in at my next step.")
+            return run
+        # A PARKED run has no active drive, so this lock is uncontended by a drive — its job is to
+        # serialize two resumers of the SAME parked run (the tick poller firing a timer AND the owner
+        # answering at the same instant), which would otherwise double-drive it.
+        with self._locked_run(run_id):
+            return self._resume(run_id, answer=answer, event=event)
+
+    def _resume(self, run_id: str, *, answer: str | None = None, event: str | None = None) -> RunState:
         run = self.store.get_run(run_id)
         if run is None:
             raise KeyError(f"unknown run {run_id}")
@@ -328,10 +369,12 @@ class Operator:
         failure is an honest parked outcome (answerable, visible) rather than a silent stuck-RUNNING.
         No-op if the run is already terminal or parked — the exception may have raced a legitimate
         settle (e.g. the drive parked the run for approval and THEN the thread died)."""
-        run = self.store.get_run(run_id)
-        if run is None or run.status not in (RunStatus.RUNNING, RunStatus.PLANNING, RunStatus.PENDING):
-            return
-        self._escalate(run, reason, reason_code="internal_error")
+        with self._locked_run(run_id):
+            run = self.store.get_run(run_id)
+            if run is None or run.status not in (RunStatus.RUNNING, RunStatus.PLANNING,
+                                                 RunStatus.PENDING):
+                return
+            self._escalate(run, reason, reason_code="internal_error")
 
     def recover(self, run_id: str) -> RunState:
         """Crash recovery: a run left in a synchronous in-flight state (RUNNING or PLANNING) by a process
@@ -341,6 +384,10 @@ class Operator:
         already VERIFIED-landed is NOT re-sent on the re-drive (the broker seeds its forwarded-gk set from the
         effect ledger). A run that crashed DURING planning has no plan yet (no effects happened) -> escalate
         honestly. A run in any other state is returned untouched (parked/waiting runs have their own resume)."""
+        with self._locked_run(run_id):
+            return self._recover(run_id)
+
+    def _recover(self, run_id: str) -> RunState:
         run = self.store.get_run(run_id)
         if run is None:
             raise KeyError(f"unknown run {run_id}")
@@ -912,7 +959,10 @@ class Operator:
     def _park_wait(self, run, plan, step, *, kind: str):
         params = step.params or {}
         if kind == "await_replies":
-            delay = _num(params.get("window_seconds"), 86400.0) or 86400.0
+            # Floor the window: a zero/negative model-authored window_seconds would make the deadline
+            # immediately due and burn a model replan every tick until the replans cap. One minute is
+            # the smallest sensible reply window.
+            delay = max(_MIN_INTERVAL_S, _num(params.get("window_seconds"), 86400.0) or 86400.0)
             # Self-hosted flowers has no inbound channel to call deliver() the moment a reply lands,
             # so the wait must POLL: a chain of interim check timers (event="check" -> probe, never
             # the deadline path) rides alongside the single window-deadline timer. Without this, a
