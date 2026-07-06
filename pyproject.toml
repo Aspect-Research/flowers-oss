@@ -26,8 +26,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/asashepard/flowers"
-Issues = "https://github.com/asashepard/flowers/issues"
+Homepage = "https://github.com/Aspect-Research/flowers-oss"
+Issues = "https://github.com/Aspect-Research/flowers-oss/issues"
 
 [project.scripts]
 flowers = "flowers.cli:main"

@@ -1,6 +1,6 @@
 # flowers
 
-[![ci](https://github.com/asashepard/flowers/actions/workflows/ci.yml/badge.svg)](https://github.com/asashepard/flowers/actions/workflows/ci.yml)
+[![ci](https://github.com/Aspect-Research/flowers-oss/actions/workflows/ci.yml/badge.svg)](https://github.com/Aspect-Research/flowers-oss/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 
