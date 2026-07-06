@@ -49,9 +49,10 @@ data: {"run_id": "run_...", "kind": "progress", "text": "step 1 done: ...", "id"
 | `done` | the run finished and the gate accepted the completion | |
 | `escalated` | the run is parked on you with a question — reply to continue, "no" to stop | `reason_code` |
 
-`reason_code` values on `escalated`: `model_error`, `model_unavailable`, `tool_failed`,
-`budget_exhausted`, `deadline_exhausted`, `owner_declined`, `internal_error` — machine-readable
-"why", alongside the human text.
+`reason_code` values on `escalated`: `model_error`, `tool_failed`, `budget_exhausted`,
+`deadline_exhausted`, `owner_declined`, `internal_error` — machine-readable "why", alongside the human
+text. (`model_unavailable` is not an escalation code — it is returned only in the `POST /api/goal` 503
+body when no model is configured, before any run is created.)
 
 ## Run status lifecycle
 

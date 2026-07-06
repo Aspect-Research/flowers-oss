@@ -981,20 +981,25 @@ class Operator:
                 # Methodical, RELENTLESS batch outreach: no replies in the window -> send the NEXT batch and
                 # wait again, while budget AND the wall-clock deadline have headroom (the wait between
                 # batches IS the backoff), up to a hard backstop. Don't give up after a fixed 3 batches.
+                done_steps = [s for s in plan.steps if s.status is StepStatus.DONE]
                 if self._has_headroom(run) and run.replans < _LADDER_HARD_CAP:
                     run.replans += 1
                     self.store.save_run(run)
-                    done_steps = [s for s in plan.steps if s.status is StepStatus.DONE]
                     newplan = self.planner.replan(
                         goal, done_steps, reason="no verified replies arrived in the window",
                         new_info="send the NEXT batch of outreach (a different/second contact) and wait again",
                         broker=self._broker(run), catalog=CAPABILITY_CATALOG,
                         memory=self.store.get_memory())
-                    self.store.save_plan(run.run_id, newplan)
-                    self._emit(run, "progress",
-                               f"no replies yet — sending the next batch (round {run.replans})")
-                    run.status = RunStatus.RUNNING
-                    return self._drive(run, goal)
+                    # No-progress guard (as at _replan_remaining / _resume_escalated): planner.replan
+                    # FAILS OPEN to a done-steps-only plan on a model/transport error. Driving that plan
+                    # would mark the run DONE — a fabricated success at the exact moment the model was
+                    # flaky. Escalate honestly instead of finalizing on an empty re-architecture.
+                    if len(newplan.steps) > len(done_steps):
+                        self.store.save_plan(run.run_id, newplan)
+                        self._emit(run, "progress",
+                                   f"no replies yet — sending the next batch (round {run.replans})")
+                        run.status = RunStatus.RUNNING
+                        return self._drive(run, goal)
                 step.status = StepStatus.FAILED
                 self.store.save_plan(run.run_id, plan)
                 self._escalate(run, f"step {step.index + 1}: no verified replies after {run.replans} round(s)")

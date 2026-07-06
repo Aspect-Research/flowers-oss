@@ -191,14 +191,16 @@ class FakeArcadeAuth(FakeArcade):
 
 
 def test_authorize_requires_write_AND_readback_tools():
-    # send granted, read-back not -> still pending, and the consent url is for the READ tool
+    # send granted, read-back not -> still pending, and the consent url is for the READ-BACK tool
+    # (Gmail.ListEmailsByHeader — the exact tool the Sent-mailbox verification calls).
     a = ArcadeIntegrations(client=FakeArcadeAuth(granted={"Gmail.SendEmail"}))
     status, url = a.authorize("gmail", "u1")
-    assert status == "pending" and "Gmail.ListEmails" in url
+    assert status == "pending" and "Gmail.ListEmailsByHeader" in url
     # nothing granted -> pending on the WRITE tool first
     a2 = ArcadeIntegrations(client=FakeArcadeAuth())
     status2, url2 = a2.authorize("gmail", "u1")
     assert status2 == "pending" and "Gmail.SendEmail" in url2
     # both granted -> completed
-    a3 = ArcadeIntegrations(client=FakeArcadeAuth(granted={"Gmail.SendEmail", "Gmail.ListEmails"}))
+    a3 = ArcadeIntegrations(client=FakeArcadeAuth(
+        granted={"Gmail.SendEmail", "Gmail.ListEmailsByHeader"}))
     assert a3.authorize("gmail", "u1") == ("completed", "")

@@ -24,7 +24,7 @@ serves at **$0 / no network**.
 |---|---|---|
 | model | `FakeModel` | `OpenRouterModel` (`OPENROUTER_API_KEY`) |
 | search | `FakeSearch` | `TavilySearch` (`TAVILY_API_KEY`) |
-| integrations | `FakeIntegrations` | `ArcadeIntegrations` (`ARCADE_API_KEY`; Gmail send + Calendar, dev mode = your own Google account) |
+| integrations | `FakeIntegrations` | `ArcadeIntegrations` (`ARCADE_API_KEY`; Gmail send/search/fetch/label/trash + Google Calendar, each verified by an independent read-back; dev mode = your own Google account) |
 | browser | `FakeBrowser` | `BrowserbaseBrowser` — **OFF by default**; set `BROWSERBASE_API_KEY` + `BROWSERBASE_PROJECT_ID` |
 | sandbox | `LocalSubprocessSandbox` (real local box, not a stub) | — (see extras `E2BSandbox`) |
 | store | `SqliteStore` | — (see extras `PostgresStore`) |
@@ -50,11 +50,11 @@ escalates a run when hit (it never charges anyone).
 ## Surface
 
 One REST API (`flowers/channels/web.py`, reference in [`API.md`](API.md)): `POST /api/goal`,
-`POST /api/answer`, `GET /api/runs/{id}`, `GET /api/runs/{id}/events`, `GET /events/{id}` (SSE with
-durable ids + `Last-Event-ID` resume), `/health`, `/ready`, plus the chat dashboard at `/` (a static
-asset shipped in the package). Launched by the `flowers serve` console command (or
-`uvicorn flowers.app:app`). It's a single-user local surface with **no auth** — run it on localhost.
-There are no phone/SMS/email-inbound channels in this release.
+`POST /api/answer`, `GET /api/runs`, `GET /api/runs/{id}`, `GET /api/runs/{id}/events`,
+`GET /events/{id}` (SSE with durable ids + `Last-Event-ID` resume), `/health`, `/ready`, plus the chat
+dashboard at `/` (a static asset shipped in the package). Launched by the `flowers serve` console
+command (or `uvicorn flowers.app:app`). It's a single-user local surface with **no auth** — run it on
+localhost. There are no phone/SMS/email-inbound channels in this release.
 
 ## Connect
 
@@ -65,5 +65,5 @@ Google account; there is no multi-user verifier route in this release.
 
 ## Tests
 
-`py -3 -m pytest` runs the whole suite offline, at $0, with no keys and no network (enforced by the root
+`pytest` runs the whole suite offline, at $0, with no keys and no network (enforced by the root
 `conftest.py`). Postgres tests skip unless a DSN is set. Live-adapter checks are opt-in only.

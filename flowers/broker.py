@@ -368,6 +368,7 @@ class Broker:
         except Exception as exc:  # a backend failure is a result, not a crash
             eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=side,
                                phase="failed", actor=self.actor, label=label)
+            eff.detail["grant_key"] = gk   # identity: a verified retry of THIS action can supersede it
             return BrokerResult(status="error", ok=False, effect=eff, error=f"{type(exc).__name__}: {exc}")
 
         if not ex.ok:
@@ -388,6 +389,7 @@ class Broker:
                                         error=ex.error)
             eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=side,
                                phase="failed", actor=self.actor, label=label)
+            eff.detail["grant_key"] = gk   # identity: a verified retry of THIS action can supersede it
             return BrokerResult(status="error", ok=False, effect=eff, error=ex.error)
 
         if not side:
@@ -522,10 +524,12 @@ class Broker:
         except Exception as exc:  # a backend failure is a result, not a crash
             eff = EffectRecord(toolkit="browser", action=action, side_effecting=side, phase="failed",
                                effect_kind="cua", actor=self.actor, label=label)
+            eff.detail["grant_key"] = gk   # identity: a verified retry of THIS action can supersede it
             return BrokerResult(status="error", ok=False, effect=eff, error=f"{type(exc).__name__}: {exc}")
         if not res.ok:
             eff = EffectRecord(toolkit="browser", action=action, side_effecting=side, phase="failed",
                                effect_kind="cua", actor=res.actor or self.actor, label=label)
+            eff.detail["grant_key"] = gk   # identity: a verified retry of THIS action can supersede it
             return BrokerResult(status="error", ok=False, effect=eff, error=res.error)
 
         if not side:

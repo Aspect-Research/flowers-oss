@@ -68,6 +68,7 @@ from the working directory at startup; a real environment variable always wins):
 | `FLOWERS_DB` / `FLOWERS_TIMERS_DB` | sqlite paths (defaults: `flowers.db`, `flowers_timers.db`) | — |
 | `FLOWERS_TICK_SECONDS` | durable-timer poll cadence (default 15; 0 disables) | — |
 | `FLOWERS_FORCE_OFFLINE` | pin every adapter offline (the test suite sets this) | — |
+| `FLOWERS_ENV_FILE` | path to the `.env` file to load (default `.env` in the working dir) | — |
 
 See [`.env.example`](.env.example) for every knob, including the optional-adapter keys.
 
@@ -92,8 +93,9 @@ curl -X POST localhost:8000/api/answer -H 'content-type: application/json' \
      -d '{"run_id":"<run_id>","text":"yes"}'
 ```
 
-Other routes: `GET /api/runs/{id}` (status), `GET /api/runs/{id}/events` (polling fallback),
-`GET /health` (liveness), `GET /ready` (store reachable).
+Other routes: `GET /api/runs` (recent runs — how the dashboard finds the open one to reattach to),
+`GET /api/runs/{id}` (status), `GET /api/runs/{id}/events` (polling fallback), `GET /health`
+(liveness), `GET /ready` (store reachable).
 
 ## Architecture
 
@@ -108,7 +110,7 @@ flowers/
   trustgate.py  effects.py  policy.py   the deterministic, no-LLM verdict core — the showcase
   broker.py                             the single credentialed egress (the executor holds no keys)
   types.py                              core dataclasses + the EffectRecord trust contract
-  engine/                               planner, operator, executor, clarifier, announcer, scheduler
+  engine/                               planner, operator, executor, clarifier, verifier, announcer, scheduler
   seams/                                model, search, integrations, browser, sandbox, store, timers, ...
   channels/                             web (the REST API + dashboard), inproc, base
   cli.py                                the `flowers` console command

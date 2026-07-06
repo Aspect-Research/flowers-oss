@@ -222,8 +222,12 @@ def classify_effects(
         terminal[aid] = rec
     unverified: list[str] = []
     unverifiable: list[str] = []
-    landed: set[str] = set()          # labels whose expected effect a record VERIFIED as present
-    stale_attempts: list[str] = []    # non-forwarded attempts — forgiven iff the label later landed
+    landed_gks: set[str] = set()      # grant_keys (action IDENTITIES) an independent read-back verified
+    # A non-forwarded record that claims done but a retry of the SAME action later landed. Keyed by
+    # identity (grant_key), NOT the toolkit:action label — a verified send to one recipient must never
+    # forgive a FAILED send to another. Only genuinely retryable phases qualify; a refused (money/
+    # illegal) or a deferred (unauthorized/unconnected) record is a hard refuse no sibling can soften.
+    retryable_attempts: list[tuple[str, str]] = []   # (label, grant_key)
     for aid in order:
         rec = terminal[aid]
         side_effecting = rec.get("side_effecting")
@@ -255,7 +259,9 @@ def classify_effects(
                 unverifiable.append(label)
                 continue
             if expected is True:
-                landed.add(label)
+                gk = rec.get("grant_key")
+                if gk:
+                    landed_gks.add(str(gk))     # this exact action verified -> can supersede its own retry
                 continue                        # the EXPECTED effect is present -> verified
             # A provenance-required effect is verified ONLY by its expected fingerprint via the
             # independent observer — never by bare drift of a model-chosen surface. An independent
@@ -276,15 +282,21 @@ def classify_effects(
                 unverified.append(label)        # independent read-back shows NO change -> not supported
             else:
                 unverifiable.append(label)      # drift True/None, no fingerprint -> ask the owner
+        elif phase in ("failed", "attempted"):
+            # A genuinely retryable attempt while the run claims done. A retry is normal: if a LATER
+            # record of the SAME action (matched by grant_key identity) verifiably landed, this attempt
+            # is stale history, not a fabricated completion (found live: a provider-failed create then
+            # a verified create of identical params). Resolved after the loop against landed_gks — a
+            # record with no grant_key, or whose identity never landed, stays a hard refuse.
+            retryable_attempts.append((label, str(rec.get("grant_key") or "")))
         else:
-            # attempted / deferred / denied / failed while the run claims done. A RETRY is normal:
-            # when a LATER record of the same label verifiably landed, the failed attempt is stale
-            # history, not a fabricated completion (found live: a provider-failed create followed by
-            # a verified create was refused). With no landed record, it stays a hard refuse — and a
-            # read-back that POSITIVELY proved an effect absent is never forgiven by this path (those
-            # are flagged in the forwarded branch above, not here).
-            stale_attempts.append(label)
-    unverified.extend(lbl for lbl in stale_attempts if lbl not in landed)
+            # refused / denied / deferred while the run claims done -> fabricated/unauthorized
+            # completion. No sibling can forgive it: money/illegal refusals and unconnected/unapproved
+            # deferrals are hard refuses by construction.
+            unverified.append(label)
+    for lbl, gk in retryable_attempts:
+        if not (gk and gk in landed_gks):
+            unverified.append(lbl)          # no verified retry of THIS exact action -> refuse
     return sorted(set(unverified)), sorted(set(unverifiable))
 
 

@@ -147,9 +147,14 @@ def test_redirect_revalidator_refuses_internal_redirect():
         )
 
 
-def test_redirect_revalidator_allows_public_redirect():
+def test_redirect_revalidator_allows_public_redirect(monkeypatch):
     # A public->public redirect should NOT raise the SSRF refusal (it delegates to the base handler,
     # which builds a new Request from the original req — pass a real Request so the base call works).
+    # Stub getaddrinfo to a public IP so the SSRF guard resolves WITHOUT a live DNS lookup — the suite
+    # is offline by contract ($0, no network), and a real lookup would fail closed on an air-gapped box.
+    import socket
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda host, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
     handler = _NoInternalRedirect()
     req = urllib.request.Request("https://example.com/")
     out = handler.redirect_request(

@@ -267,25 +267,49 @@ def test_canonical_url_and_content_hash():
     assert g.content_hash(None) == "<none>"
 
 
-def test_failed_attempt_forgiven_when_a_retry_verifiably_landed():
-    # Found live: a provider-failed create followed by a VERIFIED create of the same action was
-    # refused as a fabricated completion — the stale failed attempt poisoned the verdict. A retry
-    # that verifiably landed answers the fabrication concern for that label.
-    recs = [_eff(action_id="a1", phase="failed"),
-            _eff(action_id="a2", phase="forwarded", drift_present=True, expected_present=True)]
+def test_failed_attempt_forgiven_only_when_the_SAME_action_verifiably_landed():
+    # Found live: a provider-failed create followed by a VERIFIED create of IDENTICAL params was
+    # refused as a fabricated completion. A retry that verifiably landed answers the fabrication
+    # concern — but ONLY for that exact action, matched by grant_key identity (not the bare label).
+    recs = [_eff(action_id="a1", phase="failed", grant_key="cal:CREATE|deadbeef"),
+            _eff(action_id="a2", phase="forwarded", drift_present=True, expected_present=True,
+                 grant_key="cal:CREATE|deadbeef")]
     unver, unverifiable = g.classify_effects(recs, claimed_done=True)
     assert unver == [] and unverifiable == []
 
 
-def test_failed_attempt_with_no_landed_retry_still_refused():
-    unver, _ = g.classify_effects([_eff(action_id="a1", phase="failed")], claimed_done=True)
+def test_verified_send_does_NOT_forgive_a_failed_send_to_a_DIFFERENT_target():
+    # The label-aliasing false-accept the adversarial review caught: a verified send to bob must NEVER
+    # mask a FAILED send to alice just because both are gmail:GMAIL_SEND_EMAIL. Different params ->
+    # different grant_key -> the failed send is still a hard refuse. This is the core trust guarantee.
+    recs = [_eff(action_id="a1", phase="forwarded", drift_present=True, expected_present=True,
+                 grant_key="gmail:SEND|to-bob"),
+            _eff(action_id="a2", phase="failed", grant_key="gmail:SEND|to-alice")]
+    unver, _ = g.classify_effects(recs, claimed_done=True)
     assert unver == ["gmail:GMAIL_SEND_EMAIL"]
 
 
+def test_failed_attempt_with_no_landed_retry_still_refused():
+    unver, _ = g.classify_effects([_eff(action_id="a1", phase="failed", grant_key="g1")],
+                                  claimed_done=True)
+    assert unver == ["gmail:GMAIL_SEND_EMAIL"]
+
+
+def test_refused_money_action_is_never_forgiven_by_a_landed_sibling():
+    # A categorical money/illegal refusal must never be softened — not even if an unrelated action of
+    # the same toolkit:action label verifiably landed.
+    recs = [_eff(action_id="a1", phase="refused", grant_key="pay:CHARGE|x"),
+            _eff(action_id="a2", phase="forwarded", drift_present=True, expected_present=True,
+                 grant_key="pay:CHARGE|y")]
+    unver, _ = g.classify_effects(recs, claimed_done=True)
+    assert "gmail:GMAIL_SEND_EMAIL" in unver
+
+
 def test_proven_absent_is_not_forgiven_by_a_failed_sibling():
-    # The forgiveness applies ONLY to non-forwarded attempts: a read-back that POSITIVELY proved a
-    # forwarded effect absent stays a hard refuse even when another record of the label landed.
-    recs = [_eff(action_id="a1", phase="forwarded", expected_present=False),
-            _eff(action_id="a2", phase="forwarded", drift_present=True, expected_present=True)]
+    # A read-back that POSITIVELY proved a forwarded effect absent stays a hard refuse even when
+    # another record of the same identity landed.
+    recs = [_eff(action_id="a1", phase="forwarded", expected_present=False, grant_key="g"),
+            _eff(action_id="a2", phase="forwarded", drift_present=True, expected_present=True,
+                 grant_key="g")]
     unver, _ = g.classify_effects(recs, claimed_done=True)
     assert unver == ["gmail:GMAIL_SEND_EMAIL"]

@@ -40,8 +40,8 @@ web = ["starlette>=0.37", "uvicorn>=0.30"]
 postgres = ["psycopg[binary,pool]>=3.2"]   # optional flowers/extras/ PostgresStore
 browser = ["playwright>=1.40"]   # drive Browserbase cloud sessions over CDP (no local browser download)
 e2b = ["e2b>=1.0"]               # optional flowers/extras/ E2BSandbox (Firecracker microVM)
-dev = ["pytest>=8", "ruff>=0.5"]
-all = ["flowers[web,postgres,browser,dev]"]
+dev = ["pytest>=8", "ruff>=0.5", "httpx>=0.27"]   # httpx backs starlette.testclient (the web tests)
+all = ["flowers[web,postgres,browser,e2b,dev]"]
 
 [tool.setuptools.packages.find]
 include = ["flowers*"]

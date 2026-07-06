@@ -106,6 +106,13 @@ class EffectRecord:
             "expected_present": self.expected_present,
             "effect_kind": self.effect_kind,
         }
+        # The grant_key (params-bound action identity) lets the pure gate tell a retry of the SAME
+        # action from a different action that merely shares a toolkit:action label — so a verified
+        # retry can supersede its own failed attempt without a verified send to one target masking a
+        # failed send to another. Absent on legacy records (the gate falls back to action_id).
+        gk = (self.detail or {}).get("grant_key")
+        if gk:
+            d["grant_key"] = gk
         # Only include the optional self-report-guard fields when set, so legacy/auto records flow
         # through the gate byte-identically (the gate's guards are strict no-ops on missing fields).
         if self.verification is not None:

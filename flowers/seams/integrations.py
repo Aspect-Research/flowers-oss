@@ -101,15 +101,15 @@ def _key(toolkit: str, action: str) -> tuple[str, str]:
     return ((toolkit or "").lower(), (action or "").upper())
 
 
-# A representative WRITE tool per toolkit — authorizing it consents the whole scope (granting
 # The tools a toolkit's connect flow must authorize: the WRITE tool the executor acts with AND the
-# READ tool the broker's verification read-back uses. Arcade scopes per tool (found live: granting
-# Gmail.SendEmail alone yields gmail.send, and the Sent-mailbox read-back then fails with
-# authorization_required — so the gate can never verify a send). Authorizing both, in order, gives
-# the trust path its read-back; Google's include_granted_scopes makes the second consent incremental.
-# A value already containing "." is treated as an explicit tool name.
+# READ-BACK tool the broker's verification actually calls (see the ``readback`` lambdas in
+# _ARCADE_TOOLS). Arcade scopes per tool (found live: granting Gmail.SendEmail alone yields gmail.send,
+# and the Sent-mailbox read-back then fails with authorization_required — so the gate can never verify
+# a send). Authorizing both, in order, gives the trust path its read-back; Google's
+# include_granted_scopes makes the second consent incremental. A value already containing "." is
+# treated as an explicit tool name.
 _AUTH_TOOLS: dict[str, tuple[str, ...]] = {
-    "gmail": ("Gmail.SendEmail", "Gmail.ListEmails"),
+    "gmail": ("Gmail.SendEmail", "Gmail.ListEmailsByHeader"),   # ListEmailsByHeader = the Sent read-back
     "googlecalendar": ("GoogleCalendar.CreateEvent", "GoogleCalendar.ListEvents"),
 }
 
@@ -315,8 +315,9 @@ def _parse_events(val) -> dict[str, dict]:
 # read-back. The read-back is an INDEPENDENT query (a different Arcade tool) so the gate never verifies
 # an effect through the same call that performed it. A write with no reliable read-back sets
 # ``readback: None`` -> snapshot returns None -> the gate routes it to unverifiable (ask the owner).
-# NOTE: the non-Gmail Arcade tool/field names are INDICATIVE (Gmail is the live-verified one) — confirm
-# them against the live Arcade catalog when that toolkit is first connected, same as the model slugs.
+# NOTE: Gmail (send + Sent read-back) and Google Calendar (create + ListEvents read-back) are
+# live-verified end to end. Any OTHER toolkit's tool/field names are INDICATIVE — confirm them against
+# the live Arcade catalog when that toolkit is first connected, same as the model slugs.
 _ARCADE_TOOLS: dict[tuple[str, str], dict] = {
     ("gmail", "GMAIL_SEND_EMAIL"): {
         "tool": "Gmail.SendEmail",

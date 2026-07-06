@@ -405,6 +405,38 @@ def test_post_answer_missing_run_id_is_400():
         assert client.post("/api/answer", json={"run_id": "", "text": "y"}).status_code == 400
 
 
+def test_non_finite_budget_is_rejected():
+    # NaN/Infinity budget would silently disable the dollar ceiling (spent > NaN is always False),
+    # letting a run spend without bound. It must be a 400, not an accepted goal.
+    with _wire(make_brain(steps=[{"text": "noop"}])) as (client, store, _cp):
+        for bad in ("NaN", "Infinity", -1):
+            r = client.post("/api/goal", json={"text": "x", "budget": bad})
+            assert r.status_code == 400, f"budget {bad!r} was not rejected"
+        assert store.running_runs() == []
+
+
+def test_malformed_bodies_are_400_not_500():
+    with _wire(make_brain()) as (client, _store, _cp):
+        r1 = client.post("/api/goal", content=b"{not json", headers={"content-type": "application/json"})
+        assert r1.status_code == 400
+        # a non-string reply must not crash the worker (coerced to str)
+        r2 = client.post("/api/answer", json={"run_id": "nope", "text": {"a": 1}})
+        assert r2.status_code == 404   # run not found, but NOT a 500 from a type crash
+
+
+def test_terminal_done_event_is_never_lost_to_the_close_race():
+    # The SSE stream closes when the run reaches done/stopped; the final 'done' event (the run's
+    # result) must always be flushed before close, even if it lands between the batch fetch and the
+    # status read. A full replay stream must therefore always end with the done event.
+    brain = make_brain(steps=[{"text": "noop"}])
+    with _wire(brain) as (client, _store, _cp):
+        rid = client.post("/api/goal", json={"text": "noop"}).json()["run_id"]
+        _settle(client, rid, want="done")
+        with client.stream("GET", f"/events/{rid}?replay_only=1") as r:
+            body = "".join(r.iter_text())
+        assert "event: done" in body
+
+
 def test_escalation_guidance_starting_with_no_is_not_a_stop():
     # Found live: "No email needed, just finish" tripped the yes/no parser's "no " prefix and
     # STOPPED the run instead of steering it. In the escalation context, only a bare decline

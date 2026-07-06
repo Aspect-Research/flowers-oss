@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 from importlib import resources
 
 from flowers.channels.base import Channel
@@ -176,7 +177,10 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
         task.add_done_callback(_background.discard)
 
     async def post_goal(request):
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse({"error": "request body must be valid JSON"}, status_code=400)
         if not isinstance(body, dict):
             return JSONResponse({"error": "a JSON object body is required"}, status_code=400)
         if degraded:
@@ -184,20 +188,32 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
             # actionable message instead of accepting it and hanging the dashboard.
             return JSONResponse({"error": degraded, "reason_code": "model_unavailable"},
                                 status_code=503)
+        # A FINITE budget only: NaN/Infinity would silently disable the dollar ceiling (every
+        # ``spent > budget`` compares False against NaN), so the run could spend without bound.
+        try:
+            budget = float(body.get("budget", 2.0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "budget must be a number"}, status_code=400)
+        if not math.isfinite(budget) or budget < 0:
+            return JSONResponse({"error": "budget must be a finite, non-negative number"},
+                                status_code=400)
         # Create the run (fast) and return its id at once; DRIVE in the background so events stream live.
         run, goal = await asyncio.to_thread(
-            control_plane.begin, goal_text=body.get("text", ""), budget_usd=float(body.get("budget", 2.0)))
+            control_plane.begin, goal_text=str(body.get("text", "")), budget_usd=budget)
         _spawn(lambda: control_plane.drive(run, goal), run.run_id)
         return JSONResponse({"run_id": run.run_id, "status": run.status.value})
 
     async def post_answer(request):
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse({"error": "request body must be valid JSON"}, status_code=400)
         if not isinstance(body, dict) or not str(body.get("run_id") or "").strip():
             return JSONResponse({"error": "run_id required"}, status_code=400)
         run, err = _load_run(body["run_id"])
         if err is not None:
             return err
-        text = body.get("text", "")
+        text = str(body.get("text", "") or "")   # coerce: a non-string reply must not crash the worker
         _spawn(lambda: control_plane.answer(run_id=run.run_id, answer=text), run.run_id)
         return JSONResponse({"run_id": run.run_id, "status": run.status.value})
 
@@ -251,16 +267,31 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
             # run stays open: it is parked on the owner, who answers in this same conversation) or
             # the client goes away. During quiet stretches (a long model call, a parked run) an SSE
             # comment keeps the connection visibly alive through proxies and looks-frozen UIs.
+            # Every store read runs OFF the event loop (to_thread): a briefly-locked sqlite would
+            # otherwise block the whole loop — every other client and /health — for up to busy_timeout.
+            async def drain():
+                nonlocal cursor
+                out = []
+                for ev in await asyncio.to_thread(channel.log, rid, after=cursor):
+                    cursor = ev["id"]
+                    out.append(_sse(ev))
+                return out
+
             idle = 0.0
             while True:
-                batch = channel.log(rid, after=cursor)
-                for ev in batch:
-                    cursor = ev["id"]
-                    yield _sse(ev)
+                batch = await drain()
+                for chunk in batch:
+                    yield chunk
                 if batch:
                     idle = 0.0
-                run = control_plane.store.get_run(rid)
+                run = await asyncio.to_thread(control_plane.store.get_run, rid)
                 closed = run is None or run.status.value in ("done", "stopped")
+                if closed:
+                    # Final drain: an event (the terminal done/stopped) may have been appended AFTER
+                    # this iteration's batch fetch but BEFORE the status read. Flush it so the run's
+                    # last word — its result — is never lost to a close race.
+                    for chunk in await drain():
+                        yield chunk
                 if replay_only or closed:
                     return
                 if await request.is_disconnected():
