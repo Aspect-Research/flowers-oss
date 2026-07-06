@@ -478,7 +478,12 @@ class Operator:
         ans = answer if answer is not None else self._answer_for(run)
         if ans is None or not ans.strip():
             return run                                   # still waiting on the owner
-        if parse_answer(ans)["decision"] == "no":
+        # A BARE decline stops the run. A decline-prefixed sentence with substance ("no email needed,
+        # just finish the summary") is GUIDANCE — found live: a redirect that happened to start with
+        # "No" stopped the run instead of steering it. Guidance is the safe default here: it only
+        # replans (it can never authorize anything), and a plain "no"/"stop" still stops. This
+        # heuristic is escalation-only — per-action approvals keep strict yes/no parsing.
+        if parse_answer(ans)["decision"] == "no" and len(ans.split()) <= 3:
             run.status = RunStatus.STOPPED
             run.pending_approval = None
             run.updated_at = now_ts()

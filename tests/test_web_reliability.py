@@ -403,3 +403,35 @@ def test_post_answer_missing_run_id_is_400():
     with _wire(make_brain()) as (client, _store, _cp):
         assert client.post("/api/answer", json={"text": "yes"}).status_code == 400
         assert client.post("/api/answer", json={"run_id": "", "text": "y"}).status_code == 400
+
+
+def test_escalation_guidance_starting_with_no_is_not_a_stop():
+    # Found live: "No email needed, just finish" tripped the yes/no parser's "no " prefix and
+    # STOPPED the run instead of steering it. In the escalation context, only a bare decline
+    # (<= 3 words) stops; substantive guidance replans — which is safe, it authorizes nothing.
+    def fn(messages, tools, role):
+        if role == "planner" and "intake step" in messages[0]["content"]:
+            return ModelResponse(content=json.dumps({"questions": []}))
+        if role == "planner":
+            blob = json.dumps([m.get("content", "") for m in messages])
+            if "OWNER GUIDANCE" in blob:
+                return ModelResponse(content=json.dumps({"steps": [{"text": "wrap up the summary"}]}))
+            return ModelResponse(content=json.dumps({"steps": [{"text": "do the thing"}]}))
+        user = messages[1]["content"]
+        if "do the thing" in user:
+            raise RuntimeError("down")   # step 1 fails -> escalated
+        return ModelResponse(tool_calls=[ToolCall(name="finish", args={"summary": "done"})],
+                             finish_reason="tool_calls")
+
+    cp, store = _wire_direct(FakeModel(on_complete=fn))
+    run, goal = cp.begin(goal_text="x")
+    cp.drive(run, goal)
+    assert store.get_run(run.run_id).status.value == "escalated"
+    got = cp.answer(run_id=run.run_id, answer="No email needed, just finish the summary")
+    assert got.status.value == "done"    # guidance, not a stop
+
+    # a bare decline still stops
+    run2, goal2 = cp.begin(goal_text="x")
+    cp.drive(run2, goal2)
+    assert store.get_run(run2.run_id).status.value == "escalated"
+    assert cp.answer(run_id=run2.run_id, answer="no").status.value == "stopped"
