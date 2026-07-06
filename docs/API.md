@@ -9,7 +9,8 @@ Bodies are JSON; errors come back as `{"error": "...", ...}` with a meaningful s
 |---|---|---|
 | `POST` | `/api/goal` | Start a run. Body `{"text": "...", "budget": 2.0}` (budget in USD, optional). Returns `{"run_id", "status"}` immediately; the run drives in the background and streams events. **503** with `reason_code: "model_unavailable"` when no model key is configured. |
 | `POST` | `/api/answer` | Send the owner's reply to a run: an approval ("yes"/"no"), a clarifying answer, guidance for an escalated run, or a mid-run message (acknowledged and folded into the agent's next step). Body `{"run_id": "...", "text": "..."}`. **400** without `run_id`. |
-| `GET` | `/api/runs/{id}` | Run status: `{"run_id", "status", "goal", "spent_usd"}`. |
+| `GET` | `/api/runs` | Recent runs, most recently touched first (`{"runs": [{run_id, status, goal, updated_at}]}`) — how a fresh dashboard discovers the open run to reattach to. |
+| `GET` | `/api/runs/{id}` | Run status: `{"run_id", "status", "goal", "spent_usd"}` (spend summed live from the usage ledger). |
 | `GET` | `/api/runs/{id}/events` | The run's full durable event log as JSON (`?after=<id>` for a tail) — the polling fallback. |
 | `GET` | `/events/{id}` | **SSE stream**: replays the durable log, then tails live. `?replay_only=1` for replay-then-close, `?after=<id>` to resume. |
 | `GET` | `/` | The dashboard (a static page in the package). |
