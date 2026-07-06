@@ -222,6 +222,8 @@ def classify_effects(
         terminal[aid] = rec
     unverified: list[str] = []
     unverifiable: list[str] = []
+    landed: set[str] = set()          # labels whose expected effect a record VERIFIED as present
+    stale_attempts: list[str] = []    # non-forwarded attempts — forgiven iff the label later landed
     for aid in order:
         rec = terminal[aid]
         side_effecting = rec.get("side_effecting")
@@ -253,6 +255,7 @@ def classify_effects(
                 unverifiable.append(label)
                 continue
             if expected is True:
+                landed.add(label)
                 continue                        # the EXPECTED effect is present -> verified
             # A provenance-required effect is verified ONLY by its expected fingerprint via the
             # independent observer — never by bare drift of a model-chosen surface. An independent
@@ -274,8 +277,14 @@ def classify_effects(
             else:
                 unverifiable.append(label)      # drift True/None, no fingerprint -> ask the owner
         else:
-            # attempted / deferred / denied / failed but the run claims done -> fabricated completion.
-            unverified.append(label)
+            # attempted / deferred / denied / failed while the run claims done. A RETRY is normal:
+            # when a LATER record of the same label verifiably landed, the failed attempt is stale
+            # history, not a fabricated completion (found live: a provider-failed create followed by
+            # a verified create was refused). With no landed record, it stays a hard refuse — and a
+            # read-back that POSITIVELY proved an effect absent is never forgiven by this path (those
+            # are flagged in the forwarded branch above, not here).
+            stale_attempts.append(label)
+    unverified.extend(lbl for lbl in stale_attempts if lbl not in landed)
     return sorted(set(unverified)), sorted(set(unverifiable))
 
 

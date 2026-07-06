@@ -265,3 +265,27 @@ def test_canonical_url_and_content_hash():
     assert g.canonical_url("https://WWW.Example.com:443/p/#frag") == "https://example.com/p"
     assert g.content_hash("x") == g.content_hash("x")
     assert g.content_hash(None) == "<none>"
+
+
+def test_failed_attempt_forgiven_when_a_retry_verifiably_landed():
+    # Found live: a provider-failed create followed by a VERIFIED create of the same action was
+    # refused as a fabricated completion — the stale failed attempt poisoned the verdict. A retry
+    # that verifiably landed answers the fabrication concern for that label.
+    recs = [_eff(action_id="a1", phase="failed"),
+            _eff(action_id="a2", phase="forwarded", drift_present=True, expected_present=True)]
+    unver, unverifiable = g.classify_effects(recs, claimed_done=True)
+    assert unver == [] and unverifiable == []
+
+
+def test_failed_attempt_with_no_landed_retry_still_refused():
+    unver, _ = g.classify_effects([_eff(action_id="a1", phase="failed")], claimed_done=True)
+    assert unver == ["gmail:GMAIL_SEND_EMAIL"]
+
+
+def test_proven_absent_is_not_forgiven_by_a_failed_sibling():
+    # The forgiveness applies ONLY to non-forwarded attempts: a read-back that POSITIVELY proved a
+    # forwarded effect absent stays a hard refuse even when another record of the label landed.
+    recs = [_eff(action_id="a1", phase="forwarded", expected_present=False),
+            _eff(action_id="a2", phase="forwarded", drift_present=True, expected_present=True)]
+    unver, _ = g.classify_effects(recs, claimed_done=True)
+    assert unver == ["gmail:GMAIL_SEND_EMAIL"]
