@@ -78,15 +78,22 @@ class ControlPlane:
         return self.recover_run_ids(self.stalled_run_ids())
 
     def tick(self, *, at: float | None = None) -> list[RunState]:
-        """Poll due timers and resume their runs (a timer firing is a DEADLINE) — the serve-loop cycle."""
+        """Poll due timers and resume their runs — the serve-loop cycle. Most timer kinds fire as a
+        DEADLINE (event="timer"); an ``await_check`` is an interim reply CHECK (event="check") — it
+        probes the inbox mid-window without triggering the window's no-replies deadline path."""
         resumed: list[RunState] = []
-        seen: set[str] = set()
+        # One resume per run per tick — but when a run's interim check AND its window deadline are
+        # both due (due() marks BOTH fired), the deadline must win: a check-first dedup would consume
+        # the deadline silently and the window would never close.
+        chosen: dict[str, object] = {}
         for timer in self.operator.timers.due(at=at):
-            if timer.run_id in seen:
-                continue
-            seen.add(timer.run_id)
+            cur = chosen.get(timer.run_id)
+            if cur is None or (getattr(cur, "kind", "") == "await_check" and timer.kind != "await_check"):
+                chosen[timer.run_id] = timer
+        for timer in chosen.values():
             try:
-                resumed.append(self.operator.resume(timer.run_id, event="timer"))
+                event = "check" if timer.kind == "await_check" else "timer"
+                resumed.append(self.operator.resume(timer.run_id, event=event))
             except Exception:
                 # Per-run isolation: a single malformed/poisoned run must NEVER abort the whole due-batch —
                 # the other runs' timers were already claimed (fired) by due(), so an uncaught exception

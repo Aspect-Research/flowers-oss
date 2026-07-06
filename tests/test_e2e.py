@@ -144,3 +144,30 @@ def test_await_survives_simulated_process_restart(tmp_path):
     # the suspended wait + frozen plan survived on disk; resuming on the delivered reply completes it
     run2 = h2["cp"].deliver(run_id=rid)
     assert run2.status is RunStatus.DONE
+
+
+def test_interim_checks_detect_a_reply_without_an_inbound_channel():
+    # Found live: self-hosted flowers has no webhook to call deliver(), so a reply that arrived in
+    # minutes sat unseen until the window DEADLINE (two hours later). The await now POLLS: interim
+    # check timers probe the inbox mid-window, and only the window timer fires the deadline path.
+    h = build(model=make_brain(steps=_OUTREACH_STEPS, actions=_OUTREACH_ACTIONS), search=_venue_search(),
+              integrations=FakeIntegrations())
+    run = h["op"].start(Goal(text="organize the venue for the party"))
+    rid = run.run_id
+    h["cp"].answer(run_id=rid, answer="yes")            # approve the email -> parks on the await
+    assert h["store"].get_run(rid).status is RunStatus.WAITING
+
+    # an interim check with NO reply yet: keeps waiting, never triggers the next-batch deadline path
+    h["timers"].advance(181)
+    h["cp"].tick()
+    assert h["store"].get_run(rid).status is RunStatus.WAITING
+    assert h["store"].get_run(rid).replans == 0         # no "next batch" was sent
+
+    # the reply lands in the INBOX ONLY — deliver() is never called (there is no inbound channel)
+    h["integ"].deliver_inbound("local", sender="venue@hall.com",
+                               subject="re: venue inquiry", body="we're available!")
+    h["timers"].advance(181)                            # the re-armed interim check comes due
+    h["cp"].tick()
+    run2 = h["store"].get_run(rid)
+    assert run2.status is RunStatus.AWAITING_APPROVAL   # reply seen mid-window -> on to the booking
+    assert run2.pending_approval.effect_label == "googlecalendar:GOOGLECALENDAR_CREATE_EVENT"

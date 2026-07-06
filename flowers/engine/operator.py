@@ -63,6 +63,7 @@ _MAX_RECURRING_OCCURRENCES_HARD = 10000  # HARD backstop on a recurring step (a 
 #                                 budget nor an absent deadline bounds it) — it can't re-arm forever.
 _MIN_INTERVAL_S = 60.0     # floor on a monitor interval so a tiny/negative value can't thrash tick()
 _CONNECT_POLL_S = 15.0     # how often a parked-on-connect run polls for the OAuth grant to land
+_AWAIT_CHECK_S = 180.0     # default interim reply-check cadence while an await window is open
 _MAX_CONNECT_POLLS = 240   # backstop on connect polls (~1h @ 15s); the run's deadline_ts also bounds it
 
 _PROVIDER_LABELS = {"gmail": "Gmail", "googlecalendar": "Google Calendar"}
@@ -912,6 +913,17 @@ class Operator:
         params = step.params or {}
         if kind == "await_replies":
             delay = _num(params.get("window_seconds"), 86400.0) or 86400.0
+            # Self-hosted flowers has no inbound channel to call deliver() the moment a reply lands,
+            # so the wait must POLL: a chain of interim check timers (event="check" -> probe, never
+            # the deadline path) rides alongside the single window-deadline timer. Without this, a
+            # reply sits unseen until the deadline (found live: a reply answered in minutes was
+            # invisible for the full two-hour window).
+            step.params["_await_deadline_ts"] = self.timers.now() + delay
+            check = max(_MIN_INTERVAL_S,
+                        _num(params.get("check_seconds"), _AWAIT_CHECK_S) or _AWAIT_CHECK_S)
+            if check < delay:
+                self.timers.schedule(run_id=run.run_id, wake_at=self.timers.now() + check,
+                                     kind="await_check", payload={"step": step.index})
         else:   # monitor / recurring: a floored interval between wakes
             delay = max(_MIN_INTERVAL_S, _num(params.get("interval_seconds"), 3600.0) or 3600.0)
         self.timers.schedule(run_id=run.run_id, wake_at=self.timers.now() + delay, kind=kind,
@@ -987,7 +999,16 @@ class Operator:
                 self.store.save_plan(run.run_id, plan)
                 self._escalate(run, f"step {step.index + 1}: no verified replies after {run.replans} round(s)")
                 return run
-            self.store.save_run(run)   # a non-matching/early reply -> keep waiting (never complete on it)
+            # A non-matching/early check -> keep waiting (never complete on it), and RE-ARM the next
+            # interim check while the window has room (the deadline timer itself stays pending).
+            deadline_ts = _num((step.params or {}).get("_await_deadline_ts"), 0.0) or 0.0
+            check = max(_MIN_INTERVAL_S,
+                        _num((step.params or {}).get("check_seconds"), _AWAIT_CHECK_S) or _AWAIT_CHECK_S)
+            now = self.timers.now()
+            if event == "check" and deadline_ts and now + check < deadline_ts:
+                self.timers.schedule(run_id=run.run_id, wake_at=now + check,
+                                     kind="await_check", payload={"step": step.index})
+            self.store.save_run(run)
             return run
 
         if step.kind is StepKind.MONITOR:
