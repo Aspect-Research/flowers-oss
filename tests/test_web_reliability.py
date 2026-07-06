@@ -385,6 +385,20 @@ def test_run_status_reports_live_spend():
         assert abs(client.get(f"/api/runs/{rid}").json()["spent_usd"] - 0.42) < 1e-9
 
 
+def test_list_runs_endpoint_surfaces_open_runs_first():
+    # GET /api/runs is how a FRESH browser (no localStorage) finds the conversation to reattach
+    # to — runs started via curl or another client must be discoverable server-side.
+    brain = make_brain(steps=[{"text": "email the venue"}],
+                       actions={"email the venue": [ToolCall(name="send_email",
+                                args={"to": "bob@acme.com", "subject": "hi"})]})
+    with _wire(brain) as (client, _store, _cp):
+        rid = client.post("/api/goal", json={"text": "email the venue"}).json()["run_id"]
+        assert _settle(client, rid, want="awaiting_approval") == "awaiting_approval"
+        runs = client.get("/api/runs").json()["runs"]
+        assert runs and runs[0]["run_id"] == rid
+        assert runs[0]["status"] == "awaiting_approval" and "email the venue" in runs[0]["goal"]
+
+
 def test_post_answer_missing_run_id_is_400():
     with _wire(make_brain()) as (client, _store, _cp):
         assert client.post("/api/answer", json={"text": "yes"}).status_code == 400

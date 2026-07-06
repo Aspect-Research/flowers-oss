@@ -211,6 +211,17 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
         return JSONResponse({"run_id": run.run_id, "status": run.status.value,
                              "goal": run.goal_text, "spent_usd": spent})
 
+    async def list_runs(request):
+        """Recent runs, most recently touched first. This is how a FRESH dashboard finds the open
+        run regardless of which client started it (curl, another browser) — a single-user tool has
+        exactly one conversation to pick up, so discovery must be server-side, not localStorage."""
+        runs = await asyncio.to_thread(control_plane.store.list_runs)
+        runs.sort(key=lambda r: r.updated_at, reverse=True)
+        return JSONResponse({"runs": [
+            {"run_id": r.run_id, "status": r.status.value, "goal": r.goal_text,
+             "updated_at": r.updated_at}
+            for r in runs[:20]]})
+
     def _after_cursor(request) -> int:
         """The SSE resume cursor: ``?after=<eid>`` (manual reconnects, tests, the polling fallback)
         or the ``Last-Event-ID`` header (EventSource sends it automatically on auto-reconnect).
@@ -298,6 +309,7 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
             Route("/ready", ready),
             Route("/api/goal", post_goal, methods=["POST"]),
             Route("/api/answer", post_answer, methods=["POST"]),
+            Route("/api/runs", list_runs),
             Route("/api/runs/{run_id}", get_run),
             Route("/api/runs/{run_id}/events", get_events),
             Route("/events/{run_id}", sse),
