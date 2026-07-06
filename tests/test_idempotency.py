@@ -157,3 +157,26 @@ def test_recover_stalled_escalates_a_planning_crash():
     recovered = h["cp"].recover_stalled()
     assert any(r is not None and r.run_id == "r1" for r in recovered)
     assert store.get_run("r1").status is RunStatus.ESCALATED
+
+
+def test_unverifiable_forwarded_send_is_not_resent_and_replay_stays_unverified():
+    # Found live: a scope-blocked read-back left a provider-ACCEPTED send unverifiable
+    # (expected_present None), and the executor's retry re-sent it — a real duplicate email.
+    # A provider-accepted send must never re-execute; only a read-back that PROVES the effect
+    # missing (False) re-opens it. And the dedup replay must NOT fabricate verification: an
+    # unverifiable original replays as unverifiable, so the gate still routes to the owner.
+    integ = FakeIntegrations(no_readback={"gmail"})
+    b = Broker(integrations=integ, run_id="r1")
+    params = {"to": "bob@acme.com", "subject": "hi", "body": "x"}
+    gk = b.grant_key_for("gmail", "GMAIL_SEND_EMAIL", params)
+
+    r1 = b.call_integration(toolkit="gmail", action="GMAIL_SEND_EMAIL", params=params,
+                            user_id="u1", grants={gk})
+    assert r1.ok and r1.effect.phase == "forwarded" and r1.effect.expected_present is None
+
+    r2 = b.call_integration(toolkit="gmail", action="GMAIL_SEND_EMAIL", params=params,
+                            user_id="u1", grants={gk})
+    assert r2.ok and r2.data.get("idempotent") is True          # short-circuited, not re-sent
+    assert r2.effect.expected_present is None                   # replay does NOT claim verified
+    sent = integ.surface("u1", "sent")
+    assert len(sent) == 1, f"duplicate send! sent-mailbox has {len(sent)} items"

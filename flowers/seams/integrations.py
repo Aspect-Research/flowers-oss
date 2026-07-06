@@ -102,19 +102,28 @@ def _key(toolkit: str, action: str) -> tuple[str, str]:
 
 
 # A representative WRITE tool per toolkit — authorizing it consents the whole scope (granting
-# Gmail.SendEmail grants gmail.send). Used by ArcadeIntegrations.authorize to map a toolkit -> the tool
-# whose OAuth flow the user completes. A value already containing "." is treated as an explicit tool name.
-_AUTH_TOOL: dict[str, str] = {
-    "gmail": "Gmail.SendEmail",
-    "googlecalendar": "GoogleCalendar.CreateEvent",
+# The tools a toolkit's connect flow must authorize: the WRITE tool the executor acts with AND the
+# READ tool the broker's verification read-back uses. Arcade scopes per tool (found live: granting
+# Gmail.SendEmail alone yields gmail.send, and the Sent-mailbox read-back then fails with
+# authorization_required — so the gate can never verify a send). Authorizing both, in order, gives
+# the trust path its read-back; Google's include_granted_scopes makes the second consent incremental.
+# A value already containing "." is treated as an explicit tool name.
+_AUTH_TOOLS: dict[str, tuple[str, ...]] = {
+    "gmail": ("Gmail.SendEmail", "Gmail.ListEmails"),
+    "googlecalendar": ("GoogleCalendar.CreateEvent", "GoogleCalendar.ListEvents"),
 }
 
 
-def _auth_tool_for(toolkit_or_tool: str) -> str:
+def _auth_tools_for(toolkit_or_tool: str) -> tuple[str, ...]:
     s = str(toolkit_or_tool or "").strip()
     if "." in s:           # already a qualified tool name (e.g. "Gmail.SendEmail")
-        return s
-    return _AUTH_TOOL.get(s.lower(), s)
+        return (s,)
+    return _AUTH_TOOLS.get(s.lower(), (s,))
+
+
+def _auth_tool_for(toolkit_or_tool: str) -> str:
+    """The primary (write) auth tool — kept for callers that need a single representative tool."""
+    return _auth_tools_for(toolkit_or_tool)[0]
 
 
 def fingerprint_for(toolkit: str, action: str, params: dict) -> dict | None:
@@ -510,17 +519,20 @@ class ArcadeIntegrations:
 
     def authorize(self, toolkit_or_tool: str, user_id: str) -> tuple[str, str]:
         """Start (or check) the OAuth connect flow for a toolkit/tool for ``user_id`` via Arcade, returning
-        ``(status, url)``: ``status == 'completed'`` (url='') when the scope is already granted, else a
-        pending/started status with the consent URL to send the user. Wraps ``client.tools.authorize``. A
-        backend failure returns ``('error', '')`` — never raises, so an auth probe can't crash a run/tick.
-        Granting one representative write tool consents the whole toolkit scope (e.g. Gmail.SendEmail ->
-        gmail.send)."""
-        tool_name = _auth_tool_for(toolkit_or_tool)
+        ``(status, url)``: ``status == 'completed'`` (url='') only when EVERY tool the toolkit needs is
+        granted — the write tool the executor acts with AND the read tool the verification read-back
+        uses (see _AUTH_TOOLS; a send the broker cannot read back is a send the gate cannot verify).
+        Otherwise the first ungranted tool's pending status + consent URL is returned; the connect
+        poll walks the owner through the remaining consents in order (Google's incremental auth makes
+        follow-ups quick). A backend failure returns ``('error', '')`` — never raises, so an auth
+        probe can't crash a run/tick."""
         try:
             client = self._arcade()
-            resp = client.tools.authorize(tool_name=tool_name, user_id=user_id)
+            for tool_name in _auth_tools_for(toolkit_or_tool):
+                resp = client.tools.authorize(tool_name=tool_name, user_id=user_id)
+                status = str(getattr(resp, "status", None) or "pending")
+                if status != "completed":
+                    return (status, str(getattr(resp, "url", None) or ""))
         except Exception:
             return ("error", "")
-        status = str(getattr(resp, "status", None) or "pending")
-        url = str(getattr(resp, "url", None) or "")
-        return (status, url)
+        return ("completed", "")

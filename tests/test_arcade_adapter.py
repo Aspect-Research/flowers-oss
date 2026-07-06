@@ -165,3 +165,40 @@ def test_calendar_create_that_does_not_land_is_refused():
     assert res.effect.expected_present is False
     accept, _ = _gate(res.effect)
     assert accept is False
+
+# --- the connect flow must authorize the READ-BACK tool too (found live: gmail.send alone
+# leaves the Sent read-back 403-unauthorized, so the gate can never verify a send) ---
+
+class _AuthFlow:
+    def __init__(self, status, url=""):
+        self.status = status
+        self.url = url
+
+
+class _AuthTools(_Tools):
+    def authorize(self, *, tool_name, user_id):
+        granted = self._p.granted
+        if tool_name in granted:
+            return _AuthFlow("completed")
+        return _AuthFlow("pending", f"https://consent.example/{tool_name}?user={user_id}")
+
+
+class FakeArcadeAuth(FakeArcade):
+    def __init__(self, granted=()):
+        super().__init__()
+        self.granted = set(granted)
+        self.tools = _AuthTools(self)
+
+
+def test_authorize_requires_write_AND_readback_tools():
+    # send granted, read-back not -> still pending, and the consent url is for the READ tool
+    a = ArcadeIntegrations(client=FakeArcadeAuth(granted={"Gmail.SendEmail"}))
+    status, url = a.authorize("gmail", "u1")
+    assert status == "pending" and "Gmail.ListEmails" in url
+    # nothing granted -> pending on the WRITE tool first
+    a2 = ArcadeIntegrations(client=FakeArcadeAuth())
+    status2, url2 = a2.authorize("gmail", "u1")
+    assert status2 == "pending" and "Gmail.SendEmail" in url2
+    # both granted -> completed
+    a3 = ArcadeIntegrations(client=FakeArcadeAuth(granted={"Gmail.SendEmail", "Gmail.ListEmails"}))
+    assert a3.authorize("gmail", "u1") == ("completed", "")

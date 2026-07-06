@@ -1298,13 +1298,15 @@ class Operator:
         if mandate and disc:
             mandate = {**mandate,
                        "recipient_scope": list(mandate.get("recipient_scope") or []) + sorted(disc)}
-        # Seed run-scoped IDEMPOTENCY: grant_keys of side-effects already VERIFIED-as-landed in PRIOR steps,
-        # so a replanned/re-attempted step that re-issues a byte-identical send is short-circuited (never a
-        # duplicate). Same condition the broker uses to ADD a gk in-loop (expected_present True), so seed and
-        # in-loop set stay consistent across steps + restarts. The grant_key rides in the effect's detail.
-        forwarded_gks = {e.detail.get("grant_key") for e in self.store.get_effects(run.run_id)
-                         if e.side_effecting and e.phase == "forwarded"
-                         and e.expected_present is True and e.detail.get("grant_key")}
+        # Seed run-scoped IDEMPOTENCY: grant_keys of side-effects the provider ACCEPTED in PRIOR steps
+        # (landed OR unverifiable), so a replanned/re-attempted step that re-issues a byte-identical
+        # send is short-circuited (never a duplicate). Same condition the broker uses to ADD a gk
+        # in-loop (expected_present is not False), so seed and in-loop set stay consistent across
+        # steps + restarts; only a read-back that PROVED the effect missing re-opens the action.
+        prior = [e for e in self.store.get_effects(run.run_id)
+                 if e.side_effecting and e.phase == "forwarded" and e.detail.get("grant_key")]
+        forwarded_gks = {e.detail["grant_key"] for e in prior if e.expected_present is not False}
+        verified_gks = {e.detail["grant_key"] for e in prior if e.expected_present is True}
         return Broker(model=self.model, search=self.search, integrations=self.integrations,
                       browser=self.browser, overrides=self.overrides,
                       mandate=mandate, mandate_counts=run.mandate_counts,
@@ -1314,7 +1316,7 @@ class Operator:
                       on_activity=lambda text: self._emit(run, "progress", f"step in progress — {text}"),
                       run_id=run.run_id,
                       verify_attempts=self.verify_attempts, verify_delay=self.verify_delay,
-                      forwarded_gks=forwarded_gks)
+                      forwarded_gks=forwarded_gks, verified_gks=verified_gks)
 
     def _record_trust(self, run, appr) -> None:
         """Count a clean owner approval of a reversible, NON-delivering action class, so learned trust can

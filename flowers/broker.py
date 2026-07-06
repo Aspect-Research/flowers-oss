@@ -134,6 +134,7 @@ class Broker:
         verify_attempts: int = 1,
         verify_delay: float = 0.0,
         forwarded_gks: set | None = None,
+        verified_gks: set | None = None,
     ):
         self.model = model
         self.search_client = search
@@ -163,9 +164,16 @@ class Broker:
         # this run (seeded by the operator from the persisted effect ledger, then extended in-loop as
         # this broker forwards+verifies more). A byte-identical action whose gk is in here is NEVER
         # re-executed and NEVER re-prompted — the no-double-send invariant made mechanical across
-        # retries, ladder climbs, plan replans, and process restarts. Widens nothing about
-        # verification: an action only enters the set AFTER an independent read-back confirmed it landed.
+        # retries, ladder climbs, plan replans, and process restarts. An action enters the set when the
+        # provider ACCEPTED it and the read-back did not POSITIVELY show it missing (landed OR
+        # unverifiable): re-issuing a provider-accepted send just because we couldn't verify it is how
+        # duplicates happen (found live: a scope-blocked read-back made the executor re-send). Only a
+        # read-back that proves the effect did NOT land (expected_present False) re-opens the action.
         self._forwarded_gks: set = set(forwarded_gks or ())
+        # The VERIFIED subset of the above (read-back confirmed landed). An idempotent replay may only
+        # claim expected_present=True when the ORIGINAL verified — replaying an unverifiable send as
+        # verified would fabricate the very evidence the gate exists to demand.
+        self._verified_gks: set = set(verified_gks or ())
         self.spent_usd = 0.0
 
     # ---------------------------------------------------------------- metering
@@ -255,12 +263,16 @@ class Broker:
         was sent and read-back-verified the first time) marked ``idempotent_replay`` for the audit trail,
         and return ok WITHOUT touching the backend. This blocks BOTH authorization paths — a cached owner
         grant (silent re-execute) and a fresh per-action approval (a reflexive owner 'yes' on a duplicate)
-        — closing the replan/ladder duplicate-send hole. For a composio effect the replay carries
-        ``expected_present=True`` so the step's own ``effect_landed`` is satisfied without a duplicate; a
-        cua/browser replay carries no independent observer, so the gate conservatively routes it to the
-        owner rather than auto-verifying a replay it did not itself observe (safe, never a duplicate)."""
+        — closing the replan/ladder duplicate-send hole. For a composio effect whose ORIGINAL was
+        read-back-verified, the replay carries ``expected_present=True`` so the step's own
+        ``effect_landed`` is satisfied without a duplicate; an UNVERIFIABLE original replays as
+        unverifiable (expected_present=None) — the gate still routes it to the owner, it just can't be
+        re-sent. A cua/browser replay carries no independent observer, so the gate conservatively
+        routes it to the owner rather than auto-verifying a replay it did not itself observe."""
+        verified = gk in self._verified_gks
         eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=True, phase="forwarded",
-                           drift_present=True, expected_present=True,
+                           drift_present=True if verified else None,
+                           expected_present=True if verified else None,
                            effect_kind="cua" if browser else "composio", actor=self.actor, label=label)
         eff.detail["grant_key"] = gk
         eff.detail["idempotent_replay"] = True
@@ -417,8 +429,10 @@ class Broker:
             eff.detail["authorized_by"] = "mandate"
         elif learned_covered:
             eff.detail["authorized_by"] = "learned"
-        if expected is True:   # VERIFIED-landed -> never re-send this exact action again this run
-            self._forwarded_gks.add(gk)
+        if side and expected is not False:   # landed OR unverifiable -> never re-send this run;
+            self._forwarded_gks.add(gk)      # only a read-back PROVING it missing re-opens the action
+        if side and expected is True:
+            self._verified_gks.add(gk)       # a replay of THIS action may honestly claim verified
         return BrokerResult(status="ok", ok=True, data=ex.data, effect=eff)
 
     # ---------------------------------------------------------------- browser (the cua trust path)
@@ -548,8 +562,10 @@ class Broker:
         if mandate_covered:   # count the forwarded action against the caps + stamp the audit trail
             mandate_lib.bump(self.mandate_counts, toolkit="browser", action=action, params=params)
             eff.detail["authorized_by"] = "mandate"
-        if expected is True:   # VERIFIED-landed -> never re-do this exact action again this run
-            self._forwarded_gks.add(gk)
+        if side and expected is not False:   # landed OR unverifiable -> never re-do this run;
+            self._forwarded_gks.add(gk)      # only an observation PROVING it missing re-opens the action
+        if side and expected is True:
+            self._verified_gks.add(gk)
         return BrokerResult(status="ok", ok=True, data={"text": res.text, "url": res.url}, effect=eff)
 
     def perform_pending(self, *, pending: dict, user_id: str, grants: set | None = None) -> BrokerResult:
