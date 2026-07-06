@@ -41,8 +41,7 @@ steps execute (including heartbeats while it thinks and searches), and a chat tr
 approve actions, answer questions, redirect it mid-run, and pick up escalated runs. Events are durable —
 restart the server mid-run and a reconnecting dashboard replays the full timeline and picks up live.
 
-<!-- TODO: screenshot -->
-<!-- ![the flowers dashboard mid-run](docs/dashboard.png) -->
+![the flowers dashboard mid-run](docs/dashboard.png)
 
 ## Quickstart
 

@@ -280,7 +280,8 @@ async function submit(){
       const r=await post('/api/goal',{text});
       const j=await r.json();
       if(!r.ok){clearWorking();sys(j.error||'request failed');setPhase('Idle');return;}
-      rid=j.run_id; connect();
+      rid=j.run_id; try{localStorage.setItem('flowers_rid',rid);}catch(_){}
+      connect();
     }else{
       const r=await post('/api/answer',{run_id:rid,text});
       const j=await r.json();
@@ -295,4 +296,18 @@ function quickReply(v){if(busy)return;msg.value=v;submit();}
 send.onclick=submit;
 msg.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submit();}});
 msg.focus();
+
+// Reattach after a page reload: the event log is durable server-side, so an open run can be
+// rejoined with a full replay — a reload (or a server restart + reload) never loses the timeline.
+(async function reattach(){
+  let stored=null; try{stored=localStorage.getItem('flowers_rid');}catch(_){}
+  if(!stored)return;
+  try{
+    const r=await fetch('/api/runs/'+stored);
+    if(!r.ok){try{localStorage.removeItem('flowers_rid');}catch(_){} return;}
+    const j=await r.json();
+    if(j.status==='done'||j.status==='stopped'){try{localStorage.removeItem('flowers_rid');}catch(_){} return;}
+    rid=stored; bubble('user',null,j.goal); setPhase('Reconnecting…'); connect();
+  }catch(_){}
+})();
 </script></body></html>

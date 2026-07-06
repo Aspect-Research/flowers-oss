@@ -205,8 +205,11 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
         run, err = _load_run(request.path_params["run_id"])
         if err is not None:
             return err
+        # Spend comes from the usage ledger, not the persisted RunState field — the field only
+        # refreshes at settle points, so it lags (reads $0.00) through a long in-flight step.
+        spent = await asyncio.to_thread(control_plane.store.run_spend, run.run_id)
         return JSONResponse({"run_id": run.run_id, "status": run.status.value,
-                             "goal": run.goal_text, "spent_usd": run.spent_usd})
+                             "goal": run.goal_text, "spent_usd": spent})
 
     def _after_cursor(request) -> int:
         """The SSE resume cursor: ``?after=<eid>`` (manual reconnects, tests, the polling fallback)

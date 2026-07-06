@@ -373,6 +373,18 @@ def test_recovery_emits_into_durable_log(tmp_path):
 
 # --------------------------------------------------------------------- request hygiene
 
+def test_run_status_reports_live_spend():
+    # GET /api/runs/{id} must sum the usage ledger, not echo the persisted RunState field — that
+    # field only refreshes at settle points, so it reads $0.00 through a long in-flight step
+    # (caught in live verification: a 10-minute run showed spent_usd 0.0 the whole way).
+    brain = make_brain(steps=[{"text": "noop"}])
+    with _wire(brain) as (client, store, _cp):
+        rid = client.post("/api/goal", json={"text": "noop"}).json()["run_id"]
+        _settle(client, rid, want="done")
+        store.record_usage(run_id=rid, kind="model", cost_usd=0.42, detail={})
+        assert abs(client.get(f"/api/runs/{rid}").json()["spent_usd"] - 0.42) < 1e-9
+
+
 def test_post_answer_missing_run_id_is_400():
     with _wire(make_brain()) as (client, _store, _cp):
         assert client.post("/api/answer", json={"text": "yes"}).status_code == 400
