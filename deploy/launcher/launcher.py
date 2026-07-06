@@ -69,7 +69,9 @@ ALLOWED_ORIGINS = [
 ]
 MAX_SESSIONS = int(os.environ.get("DEMO_MAX_SESSIONS", "6"))
 LAUNCHES_PER_HOUR_PER_IP = int(os.environ.get("DEMO_LAUNCHES_PER_HOUR_PER_IP", "3"))
-FREE_MODEL = os.environ.get("DEMO_FREE_MODEL", "deepseek/deepseek-chat-v3-0324:free")
+# Free slugs churn on OpenRouter — verify against /api/v1/models when this
+# misbehaves. qwen3-next-80b-a3b is lightweight (3B active) with tool calling.
+FREE_MODEL = os.environ.get("DEMO_FREE_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
 # The worker's own watchdog (idle 15 min / age 45 min) is the primary lifetime
 # bound; the reaper's orphan cutoff sits safely above it.
 ORPHAN_MAX_AGE_S = 50 * 60
