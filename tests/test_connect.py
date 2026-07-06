@@ -103,6 +103,31 @@ def test_connect_poll_re_arms_while_still_pending():
     assert h["store"].get_run(run.run_id).status is RunStatus.DONE
 
 
+def test_connect_card_refreshes_when_the_provider_remints_the_flow():
+    # Providers EXPIRE pending consent flows (found live: a stale connect link dead-ends with a
+    # confusing provider error and no grant). When a poll sees a NEW consent url, the operator must
+    # re-emit the connect card so the owner's tappable link is always the live flow.
+    integ = FakeIntegrations(unauthorized={"gmail"})
+    h = build(model=_connect_brain(), integrations=integ)
+    urls = iter(["https://connect.arcade.test/gmail?flow=old",
+                 "https://connect.arcade.test/gmail?flow=NEW",
+                 "https://connect.arcade.test/gmail?flow=NEW"])
+
+    def authorize(toolkit_or_tool, user_id):
+        return ("pending", next(urls))
+
+    integ.authorize = authorize                    # the provider re-mints the flow between polls
+    run = h["op"].start(Goal(text="summarize my inbox"))
+    assert run.status is RunStatus.AWAITING_CONNECT
+    h["timers"].advance(_CONNECT_POLL_S + 1)
+    h["cp"].tick()                                 # poll 2 sees flow=NEW -> a fresh connect card
+    h["timers"].advance(_CONNECT_POLL_S + 1)
+    h["cp"].tick()                                 # poll 3 sees the SAME url -> no duplicate card
+    evs = h["channel"].of_kind("connect")
+    assert [e["url"] for e in evs].count("https://connect.arcade.test/gmail?flow=NEW") == 1
+    assert "fresh link" in evs[-1]["text"]
+
+
 def test_connect_park_survives_a_process_restart_and_resumes_at_action():
     # A parked-on-connect run must rehydrate from the Store in a FRESH process (cold caches) and STILL
     # resume-at-action when the grant lands: the continuation blob (connect + resume_state) is the source

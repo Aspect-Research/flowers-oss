@@ -556,6 +556,16 @@ class Operator:
             self._escalate(run, f"couldn't connect your {_provider_label(toolkit)} in time — tap the link "
                                 "I sent and I'll pick right back up")
             return run
+        # Providers EXPIRE pending consent flows and mint fresh ones (found live: a stale connect
+        # link dead-ends at the provider with no grant and a confusing error). Each poll returns the
+        # CURRENT consent URL — when it changes, re-emit the connect card so the owner's tappable
+        # link is always the live flow, not a dead replay.
+        fresh_url = str(_res[1]) if len(_res) > 1 and _res[1] else ""
+        if fresh_url and fresh_url != meta.get("url"):
+            meta["url"] = fresh_url
+            provider = _provider_label(toolkit)
+            self._emit(run, "connect", f"connect your {provider} (fresh link — the old one expired)",
+                       url=fresh_url, provider=provider)
         meta["polls"] = polls
         self._connect[run.run_id] = meta
         self._persist_continuation(run.run_id)
