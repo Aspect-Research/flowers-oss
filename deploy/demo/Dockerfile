@@ -25,4 +25,6 @@ ENV FLOWERS_DB=/tmp/flowers.db \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "wrapper:app", "--host", "0.0.0.0", "--port", "8000"]
+# Bind "::" — the launcher reaches workers over Fly's private network, which
+# is IPv6 (6PN); an IPv4-only 0.0.0.0 bind refuses those connections.
+CMD ["python", "-m", "uvicorn", "wrapper:app", "--host", "::", "--port", "8000"]

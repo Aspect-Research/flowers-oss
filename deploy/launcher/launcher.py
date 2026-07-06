@@ -37,6 +37,8 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
+from contextlib import asynccontextmanager
+
 import httpx
 import uvicorn
 from starlette.applications import Starlette
@@ -327,8 +329,13 @@ async def _reaper() -> None:
             log.exception("reaper iteration failed")
 
 
-def _startup() -> None:
-    asyncio.get_event_loop().create_task(_reaper())
+@asynccontextmanager
+async def _lifespan(_app):
+    task = asyncio.create_task(_reaper())
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 app = Starlette(
@@ -351,7 +358,7 @@ app = Starlette(
             allow_headers=["Content-Type", "X-Flowers-Session-Token", "Last-Event-ID"],
         )
     ],
-    on_startup=[_startup],
+    lifespan=_lifespan,
 )
 
 

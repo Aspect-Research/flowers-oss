@@ -1,0 +1,9 @@
+# Config for the worker IMAGE build only — machines in this app are created
+# by the launcher via the Machines API, never by `fly deploy`.
+# Build+push from the repo root:
+#   flyctl deploy -c deploy/demo/fly.toml --build-only --push --image-label worker
+app = "flowers-demo-workers"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
