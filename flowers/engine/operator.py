@@ -443,7 +443,7 @@ class Operator:
         prior = [(s.text, s.result.text) for s in plan.steps
                  if s.status is StepStatus.DONE and s.result is not None]
         result = self.executor.run(step, plan=plan, goal=goal, broker=broker, sandbox=sandbox,
-                                   grants=grants, user_id=runtime.LOCAL_USER, feedback=feedback, prior=prior,
+                                   grants=grants, user_id=runtime.local_user(), feedback=feedback, prior=prior,
                                    available_tools=self._available_tools(),
                                    memory=self.store.get_memory(), role=role)
         self._persist_mandate_counts(run, broker)
@@ -461,7 +461,7 @@ class Operator:
         sandbox = self._sandbox(run.run_id)
         grants = self._grants.get(run.run_id, set())
         result = self.executor.resume(resume_state, broker=broker, sandbox=sandbox,
-                                      grants=grants, user_id=runtime.LOCAL_USER)
+                                      grants=grants, user_id=runtime.local_user())
         self._persist_mandate_counts(run, broker)
         # An approved-then-performed action that fails verification is surfaced honestly (no re-run/divergence).
         outcome = self._handle_step_result(run, goal, plan, step, result, allow_redirect=False)
@@ -534,7 +534,7 @@ class Operator:
         meta = self._connect.get(run.run_id) or {}
         toolkit = meta.get("toolkit", "")
         authorize = getattr(self.integrations, "authorize", None)
-        _res = authorize(toolkit, runtime.LOCAL_USER) if callable(authorize) else ("error", "", "")
+        _res = authorize(toolkit, runtime.local_user()) if callable(authorize) else ("error", "", "")
         status = _res[0]
         if status == "completed":
             self.timers.cancel_for_run(run.run_id)
@@ -1106,7 +1106,7 @@ class Operator:
             try:
                 br = self._broker(run).call_browser(action="extract",
                                                     params={"url": params.get("url", "")},
-                                                    user_id=runtime.LOCAL_USER)
+                                                    user_id=runtime.local_user())
                 text = (br.data or {}).get("text", "") if br.status == "ok" else ""
                 return "text", text, bool(br.status == "ok" and (text or "").strip())
             except Exception:
@@ -1115,7 +1115,7 @@ class Operator:
         # fail-closed on an empty match). A MONITOR inbox-watch ("tell me when an email from X arrives")
         # reads the same inbox.
         inbox = self.integrations.snapshot(toolkit="gmail", action="GMAIL_FETCH_EMAILS",
-                                           params={}, user_id=runtime.LOCAL_USER) or {}
+                                           params={}, user_id=runtime.local_user()) or {}
         return "inbox", inbox, True
 
     def _condition_met(self, kind: str, observed, match: dict) -> list:
@@ -1213,7 +1213,7 @@ class Operator:
         br = self.browser
         if br is not None and hasattr(br, "close"):
             try:
-                br.close(user_id=runtime.LOCAL_USER)
+                br.close(user_id=runtime.local_user())
             except Exception:
                 pass
         sb = self._sandboxes.pop(run.run_id, None)

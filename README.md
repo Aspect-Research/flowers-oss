@@ -63,6 +63,7 @@ from the working directory at startup; a real environment variable always wins):
 | `OPENROUTER_API_KEY` | the model (planner + executor) | [openrouter.ai](https://openrouter.ai/settings/keys) |
 | `TAVILY_API_KEY` | web search | [app.tavily.com](https://app.tavily.com) |
 | `ARCADE_API_KEY` | Gmail send + Google Calendar ("dev mode" connects your own Google account) | [arcade.dev](https://api.arcade.dev/dashboard) |
+| `FLOWERS_USER_ID` | the per-user identity for OAuth seams — **in Arcade dev mode this must be your Arcade account email** (else `user_mismatch`) | — |
 | `BROWSERBASE_API_KEY` + `BROWSERBASE_PROJECT_ID` | browser last-mile (off by default; needs `.[browser]`) | [browserbase.com](https://browserbase.com) |
 | `FLOWERS_DB` / `FLOWERS_TIMERS_DB` | sqlite paths (defaults: `flowers.db`, `flowers_timers.db`) | — |
 | `FLOWERS_TICK_SECONDS` | durable-timer poll cadence (default 15; 0 disables) | — |

@@ -60,3 +60,12 @@ def test_adapter_available_offline_and_key_gating(monkeypatch):
     assert runtime.adapter_available(key_env="SOME_KEY") is True
     monkeypatch.delenv("SOME_KEY", raising=False)
     assert runtime.adapter_available(key_env="SOME_KEY") is False
+
+
+def test_local_user_default_and_override(monkeypatch):
+    # Arcade dev mode rejects any user_id that isn't the signed-in Arcade account (user_mismatch),
+    # so the per-user identity must be overridable without touching code.
+    monkeypatch.delenv("FLOWERS_USER_ID", raising=False)
+    assert runtime.local_user() == runtime.LOCAL_USER == "local"
+    monkeypatch.setenv("FLOWERS_USER_ID", "owner@example.com")
+    assert runtime.local_user() == "owner@example.com"

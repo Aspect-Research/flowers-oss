@@ -34,6 +34,7 @@ _PROVIDER_KEYS = (
     "BROWSERBASE_API_KEY",
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
+    "FLOWERS_USER_ID",   # not a key, but a real .env value that would skew user-identity assertions
 )
 
 # The opt-in LIVE layer (F1): under FLOWERS_LIVE=1 the live-adapter tests need REAL keys + the network,

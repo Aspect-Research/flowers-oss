@@ -16,6 +16,16 @@ import os
 LOCAL_USER = "local"
 
 
+def local_user() -> str:
+    """The identity handed to per-user seams. FLOWERS_USER_ID overrides the default.
+
+    The override exists because Arcade's dev mode ("Arcade.dev users only" verification) REJECTS any
+    authorization whose user_id differs from the signed-in Arcade account (error: user_mismatch) —
+    so a dev-mode owner must set FLOWERS_USER_ID to their Arcade account email. With a custom
+    verifier (or other providers), the default is fine."""
+    return env("FLOWERS_USER_ID") or LOCAL_USER
+
+
 def force_offline() -> bool:
     """True iff the suite/process has been pinned offline (no live model/tool/network calls)."""
     return bool(os.environ.get("FLOWERS_FORCE_OFFLINE"))
