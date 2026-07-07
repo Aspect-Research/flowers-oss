@@ -21,6 +21,11 @@ Env:
   DEMO_MAX_SESSIONS    concurrent machine cap       (default 6)
   DEMO_LAUNCHES_PER_HOUR_PER_IP                     (default 3)
   DEMO_FREE_MODEL      OpenRouter slug for free mode
+  OPERATOR_OPENROUTER_KEY  operator-funded key for keyless free mode (secret);
+                       when free_models is requested with no visitor key, the
+                       worker runs on this key. Set via `flyctl secrets set`.
+  DEMO_OPERATOR_SESSIONS_PER_IP  max concurrent operator-funded sessions per IP
+                       (default 1) — throttles free-tier quota drain per visitor.
 """
 
 from __future__ import annotations
@@ -69,6 +74,12 @@ ALLOWED_ORIGINS = [
 ]
 MAX_SESSIONS = int(os.environ.get("DEMO_MAX_SESSIONS", "6"))
 LAUNCHES_PER_HOUR_PER_IP = int(os.environ.get("DEMO_LAUNCHES_PER_HOUR_PER_IP", "3"))
+# Operator-funded free sessions (free_models + no visitor key) spend the
+# operator's OpenRouter free-tier quota, so they get a tighter concurrency cap
+# per IP on top of the shared hourly launch limit — one visitor can't hold open
+# several operator-funded workers at once and drain the shared quota.
+OPERATOR_SESSIONS_PER_IP = int(os.environ.get("DEMO_OPERATOR_SESSIONS_PER_IP", "1"))
+OPERATOR_KEY = os.environ.get("OPERATOR_OPENROUTER_KEY", "")
 # Free slugs churn on OpenRouter — verify against /api/v1/models when this
 # misbehaves. qwen3-next-80b-a3b is lightweight (3B active) with tool calling.
 FREE_MODEL = os.environ.get("DEMO_FREE_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
@@ -86,10 +97,18 @@ class Session:
     machine_id: str
     private_ip: str
     created: float = field(default_factory=time.monotonic)
+    # Client IP + operator-funded flag so we can release the per-IP operator
+    # concurrency slot when this session ends (delete / expiry / reap).
+    client_ip: str = ""
+    operator_funded: bool = False
 
 
 SESSIONS: dict[str, Session] = {}
 _launches: dict[str, deque] = defaultdict(deque)
+# Live count of operator-funded sessions per IP (concurrency cap, in-memory like
+# _launches). Incremented when an operator-funded session is reserved, decremented
+# when it ends.
+_operator_active: dict[str, int] = defaultdict(int)
 
 # One client for the Fly Machines API, one for proxying to workers (no read
 # timeout: SSE streams stay open for the length of a run).
@@ -120,6 +139,26 @@ def _launch_allowed(ip: str) -> bool:
     return True
 
 
+def _operator_slot_reserve(ip: str) -> bool:
+    """Try to reserve an operator-funded concurrency slot for this IP. Returns
+    False (caller should 429) when the IP is already at its cap."""
+    if _operator_active[ip] >= OPERATOR_SESSIONS_PER_IP:
+        return False
+    _operator_active[ip] += 1
+    return True
+
+
+def _operator_slot_release(session: Session) -> None:
+    """Give back a reserved operator-funded slot when the session ends."""
+    if not session.operator_funded:
+        return
+    n = _operator_active.get(session.client_ip, 0) - 1
+    if n > 0:
+        _operator_active[session.client_ip] = n
+    else:
+        _operator_active.pop(session.client_ip, None)
+
+
 def _worker_base(session: Session) -> str:
     return f"http://[{session.private_ip}]:8000"
 
@@ -148,21 +187,49 @@ async def create_session(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
     key = (body.get("openrouter_key") or "").strip()
     free_models = bool(body.get("free_models"))
-    if not _KEY_RE.match(key):
+
+    # Key resolution:
+    #   free_models + non-empty key  -> validate & use the visitor's key
+    #   free_models + no key         -> operator-funded (uses OPERATOR_OPENROUTER_KEY)
+    #   not free_models              -> visitor key REQUIRED and validated
+    operator_funded = False
+    if free_models and not key:
+        # Keyless free mode: run the worker on the operator's key.
+        if not OPERATOR_KEY:
+            return JSONResponse(
+                {"error": "free mode is not configured"}, status_code=503
+            )
+        worker_key = OPERATOR_KEY
+        operator_funded = True
+    else:
+        # A key was supplied (free or paid) — always validate it.
+        if not _KEY_RE.match(key):
+            return JSONResponse(
+                {"error": "openrouter_key looks malformed"}, status_code=400
+            )
+        worker_key = key
+
+    # Operator-funded sessions spend our shared free-tier quota, so cap how many
+    # a single IP can hold open at once (reserved now, released when it ends).
+    if operator_funded and not _operator_slot_reserve(ip):
         return JSONResponse(
-            {"error": "openrouter_key looks malformed"}, status_code=400
+            {"error": "too many free demo sessions from your address — try again later"},
+            status_code=429,
         )
 
     token = secrets.token_urlsafe(24)
     env = {
-        "OPENROUTER_API_KEY": key,
+        "OPENROUTER_API_KEY": worker_key,
         "FLOWERS_DEMO_TOKEN": token,
     }
     if free_models:
         env["FLOWERS_ROLE_CONFIG_JSON"] = json.dumps(
             # Role resolution falls back to "executor", so this single entry
-            # reroutes every role to the free model.
-            {"executor": {"model": FREE_MODEL, "reasoning": "low"}}
+            # reroutes every role to the free model. NOTE: omit "reasoning" —
+            # the free model doesn't support the reasoning param, and model.py
+            # only sends it when the role config carries a truthy "reasoning",
+            # so leaving it out keeps OpenRouter from rejecting the call.
+            {"executor": {"model": FREE_MODEL}}
         )
 
     machine_config = {
@@ -178,6 +245,10 @@ async def create_session(request: Request) -> JSONResponse:
     r = await _fly.post(f"/apps/{WORKER_APP}/machines", json=machine_config)
     if r.status_code >= 300:
         log.error("machine create failed: %s %s", r.status_code, r.text[:500])
+        if operator_funded:
+            _operator_slot_release(
+                Session("", "", "", "", client_ip=ip, operator_funded=True)
+            )
         return JSONResponse(
             {"error": "could not start a demo machine"}, status_code=502
         )
@@ -190,6 +261,8 @@ async def create_session(request: Request) -> JSONResponse:
         token=token,
         machine_id=machine_id,
         private_ip=private_ip,
+        client_ip=ip,
+        operator_funded=operator_funded,
     )
 
     # Wait for the machine, then for the app inside it.
@@ -212,14 +285,15 @@ async def create_session(request: Request) -> JSONResponse:
     except Exception:
         log.exception("worker %s failed to come up — destroying", machine_id)
         await _destroy_machine(machine_id)
+        _operator_slot_release(session)
         return JSONResponse(
             {"error": "demo machine failed to start"}, status_code=502
         )
 
     SESSIONS[session.session_id] = session
     log.info(
-        "session %s -> machine %s (free_models=%s)",
-        session.session_id, machine_id, free_models,
+        "session %s -> machine %s (free_models=%s operator_funded=%s)",
+        session.session_id, machine_id, free_models, operator_funded,
     )
     return JSONResponse({"session_id": session.session_id, "token": session.token})
 
@@ -235,6 +309,7 @@ async def delete_session(request: Request) -> JSONResponse:
     if session is None or not _authorized(request, session):
         return JSONResponse({"error": "unknown session"}, status_code=404)
     SESSIONS.pop(sid, None)
+    _operator_slot_release(session)
     await _destroy_machine(session.machine_id)
     return JSONResponse({"destroyed": True})
 
@@ -271,7 +346,8 @@ async def proxy(request: Request) -> Response:
         resp = await _proxy.send(upstream, stream=True)
     except httpx.HTTPError:
         # Worker likely self-destructed (idle/max-age watchdog).
-        SESSIONS.pop(sid, None)
+        if (gone := SESSIONS.pop(sid, None)) is not None:
+            _operator_slot_release(gone)
         return JSONResponse({"error": "session expired"}, status_code=410)
 
     out_headers = {
@@ -310,6 +386,7 @@ async def _reaper() -> None:
                 m = machines.get(session.machine_id)
                 if m is None or m.get("state") in ("destroyed", "stopped"):
                     SESSIONS.pop(sid, None)
+                    _operator_slot_release(session)
             known = {s.machine_id for s in SESSIONS.values()}
             now = time.time()
             for mid, m in machines.items():
