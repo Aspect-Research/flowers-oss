@@ -52,7 +52,11 @@ class FakeArcade:
                             "subject": inp.get("subject"), "from_": user_id})
             return _Resp(True, {"id": "sent-123"})
         if tool_name == "Gmail.ListEmailsByHeader":
-            rec = (inp.get("recipient") or "").lower()
+            # recipient is Arcade's ARRAY<string> header filter (confirmed live 2026-07-08) — the adapter
+            # now sends a single-element list; normalize list-or-string so the stub matches the real
+            # (list-typed) contract the schema fix restored.
+            raw = inp.get("recipient")
+            rec = (raw[0] if isinstance(raw, (list, tuple)) and raw else (raw or "")).lower()
             ems = [e for e in self._sent.get(user_id, []) if not rec or rec in (e.get("to") or "").lower()]
             return _Resp(True, {"emails": ems})
         if tool_name == "Gmail.ListEmails":
@@ -106,6 +110,19 @@ def test_snapshot_reads_back_sent_with_extracted_email():
     assert snap and len(snap) == 1
     item = next(iter(snap.values()))
     assert item["to"] == "venue@example.com" and item["subject"] == "Inquiry"   # extracted from display-name
+
+
+def test_send_readback_passes_recipient_as_a_list():
+    # Root cause A (2026-07-08): Gmail.ListEmailsByHeader.recipient is ARRAY<string>; a bare string 400s
+    # every Sent read-back. The schema fix must send a LIST, else verification is deterministically broken.
+    fake = FakeArcade()
+    a = ArcadeIntegrations(client=fake)
+    a.execute(toolkit="gmail", action="GMAIL_SEND_EMAIL",
+              params={"to": "venue@example.com", "subject": "Inquiry"}, user_id="u1")
+    a.snapshot(toolkit="gmail", action="GMAIL_SEND_EMAIL",
+               params={"to": "venue@example.com"}, user_id="u1")
+    readback = next(inp for (tool, inp, _uid) in fake.calls if tool == "Gmail.ListEmailsByHeader")
+    assert readback["recipient"] == ["venue@example.com"]   # list-typed, not the bare string
 
 
 def test_unknown_action_fails():

@@ -36,3 +36,19 @@ def test_app_has_no_auth_gate():
     # Single-user local surface: the API is reachable with no token (unknown run -> 404, never 401).
     client = TestClient(build_app(db_path=":memory:", timers_path=":memory:"))
     assert client.get("/api/runs/nope").status_code == 404
+
+
+def test_verify_polling_defaults_and_env_override(monkeypatch):
+    from flowers.app import _verify_polling
+    # offline (all fakes) stays a single instant check; live tolerates provider read-back lag.
+    monkeypatch.delenv("FLOWERS_VERIFY_ATTEMPTS", raising=False)
+    monkeypatch.delenv("FLOWERS_VERIFY_DELAY", raising=False)
+    assert _verify_polling(live=False) == (1, 0.0)
+    attempts, delay = _verify_polling(live=True)
+    assert attempts >= 2 and delay > 0.0
+    # explicit env overrides win, invalid values fall back rather than crash.
+    monkeypatch.setenv("FLOWERS_VERIFY_ATTEMPTS", "6")
+    monkeypatch.setenv("FLOWERS_VERIFY_DELAY", "0.5")
+    assert _verify_polling(live=False) == (6, 0.5)
+    monkeypatch.setenv("FLOWERS_VERIFY_ATTEMPTS", "not-a-number")
+    assert _verify_polling(live=True)[0] >= 2   # falls back to the live default

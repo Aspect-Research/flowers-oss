@@ -217,6 +217,37 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
         _spawn(lambda: control_plane.answer(run_id=run.run_id, answer=text), run.run_id)
         return JSONResponse({"run_id": run.run_id, "status": run.status.value})
 
+    async def post_route(request):
+        """Classify an inbound owner message against the caller's open runs → {intent, n}. Used by a chat
+        channel to decide task vs reply-to-run vs chat. Safe default is 'task'."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse({"error": "request body must be valid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "a JSON object body is required"}, status_code=400)
+        runs = body.get("runs") if isinstance(body.get("runs"), list) else []
+        result = await asyncio.to_thread(
+            control_plane.classify, text=str(body.get("text", "")), runs=runs)
+        return JSONResponse(result)
+
+    async def post_chat(request):
+        """One ungated conversational turn (NOT a run): cheap, persona-styled, aware of active runs. The
+        caller owns the transcript and passes recent ``history`` + a summary of its open ``runs``."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse({"error": "request body must be valid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "a JSON object body is required"}, status_code=400)
+        if degraded:
+            return JSONResponse({"error": degraded, "reason_code": "model_unavailable"}, status_code=503)
+        history = body.get("history") if isinstance(body.get("history"), list) else []
+        runs = body.get("runs") if isinstance(body.get("runs"), list) else []
+        reply = await asyncio.to_thread(
+            control_plane.chat, text=str(body.get("text", "")), history=history, runs=runs)
+        return JSONResponse({"reply": reply})
+
     async def get_run(request):
         run, err = _load_run(request.path_params["run_id"])
         if err is not None:
@@ -340,6 +371,8 @@ def create_app(control_plane, channel: WebChannel, *, poll_interval: float | Non
             Route("/ready", ready),
             Route("/api/goal", post_goal, methods=["POST"]),
             Route("/api/answer", post_answer, methods=["POST"]),
+            Route("/api/route", post_route, methods=["POST"]),
+            Route("/api/chat", post_chat, methods=["POST"]),
             Route("/api/runs", list_runs),
             Route("/api/runs/{run_id}", get_run),
             Route("/api/runs/{run_id}/events", get_events),

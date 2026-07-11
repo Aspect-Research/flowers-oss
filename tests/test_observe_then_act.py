@@ -42,7 +42,8 @@ def test_describe_leads_the_approval_prompt():
                                  "describe": "Book a table for 2 at 7pm at Otto"})
     assert res.status == "needs_approval"
     assert res.approval.prompt.startswith("Book a table for 2 at 7pm at Otto")   # the exact action, first
-    assert "browser:submit" in res.approval.prompt                              # structured line preserved
+    assert "browser:submit" not in res.approval.prompt                          # no slug in the human prompt
+    assert res.approval.effect_label == "browser:submit"                        # identity kept on the record
 
 
 # --- end-to-end: inspect -> submit(describe) -> approve -> land ----------------------------------

@@ -29,6 +29,10 @@ that meets ALL stated constraints — the deliverable is one recommendation, not
 outreach/sourcing goals, structure the work as BATCHES with explicit WAIT steps: find a small batch (e.g.
 5), contact them, then WAIT a reasonable time for replies before doing more — do NOT enumerate hundreds.
 
+RESOLVE BEFORE ACTING: if a step targets something by a BARE or ambiguous reference — a repo name
+("sandyhusks"), a person, a place — the FIRST step must resolve it to a canonical id (search/look it up),
+and the acting step depends on it. Never act on a guessed identifier (it wastes an approval and fails).
+
 Return ONLY JSON: {"steps": [{"text": str, "kind": "generic"|"await_replies"|"monitor"|"recurring",
 "depends_on": [int...], "needs": [str...], "params": {...}, "done_criteria": [{...}]}]}.
 - depends_on are 0-based indices of EARLIER steps (backward-only).

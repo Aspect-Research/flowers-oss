@@ -252,8 +252,33 @@ def test_file_checks():
 def test_effect_landed_check():
     crit = [{"id": "sent", "objective_check": {"kind": "effect_landed",
                                                "params": {"label": "gmail:GMAIL_SEND_EMAIL"}}}]
+    assert g.evaluate_objective_checks(crit, {"landed_effects": ["gmail:GMAIL_SEND_EMAIL"]}) == []
+    assert g.evaluate_objective_checks(crit, {"landed_effects": []}) == ["sent"]
+    # back-compat: a bundle that only carries the legacy strict key still satisfies the check.
     assert g.evaluate_objective_checks(crit, {"verified_effects": ["gmail:GMAIL_SEND_EMAIL"]}) == []
-    assert g.evaluate_objective_checks(crit, {"verified_effects": []}) == ["sent"]
+
+
+def test_landed_effects_counts_unverifiable_but_not_proven_missing():
+    # The done-check must accept a provider-ACCEPTED send whose read-back was unavailable
+    # (expected_present None) — otherwise the step blind-retries and double-sends. But a send the
+    # read-back PROVES missing (False) must still fail, so a genuinely-dropped send retries.
+    assert g.landed_effects([_eff(expected_present=None, drift_present=None)]) == ["gmail:GMAIL_SEND_EMAIL"]
+    assert g.landed_effects([_eff(expected_present=True)]) == ["gmail:GMAIL_SEND_EMAIL"]
+    assert g.landed_effects([_eff(expected_present=False)]) == []
+    # verified_effects (strict, for the fabrication gate + final report) still EXCLUDES the unverifiable one.
+    assert g.verified_effects([_eff(expected_present=None, drift_present=None)]) == []
+
+
+def test_effect_landed_passes_on_unverifiable_send_but_not_a_dropped_one():
+    # Regression for the live double-ask: a mandate-covered send forwarded, its Sent-label read-back was
+    # scope-blocked (unverifiable), effect_landed FAILED, the step retried, and the reworded retry re-sent
+    # and re-prompted. With landed_effects, the unverifiable send satisfies the check -> no retry.
+    crit = [{"id": "sent", "objective_check": {"kind": "effect_landed",
+                                               "params": {"label": "gmail:GMAIL_SEND_EMAIL"}}}]
+    landed = g.landed_effects([_eff(expected_present=None, drift_present=None)])
+    assert g.evaluate_objective_checks(crit, {"landed_effects": landed}) == []      # unverifiable -> done
+    dropped = g.landed_effects([_eff(expected_present=False)])
+    assert g.evaluate_objective_checks(crit, {"landed_effects": dropped}) == ["sent"]  # proven-missing -> retry
 
 
 def test_unknown_objective_kind_is_unmet():

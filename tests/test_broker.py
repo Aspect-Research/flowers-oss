@@ -52,8 +52,11 @@ def test_send_approval_prompt_shows_the_literal_body():
                              params={"to": "bob@acme.com", "subject": "Hi",
                                      "body": "Dear Bob, here is my tailored pitch."}, user_id="u1")
     assert res.status == "needs_approval"
+    # conversational: a friendly ask naming the recipient, then the literal body the owner will send.
     assert "Dear Bob, here is my tailored pitch." in res.approval.prompt
-    assert "under your name" in res.approval.prompt
+    assert "bob@acme.com" in res.approval.prompt
+    assert res.approval.prompt.lower().startswith("want me to send this email")
+    assert "gmail:GMAIL_SEND_EMAIL" not in res.approval.prompt   # no slug/JSON in the human prompt
 
 
 def test_never_tier_needs_approval_kind_never():
@@ -117,3 +120,44 @@ def test_model_metering():
     b.complete([{"role": "user", "content": "hi"}], role="planner")
     assert abs(b.spent_usd - 0.02) < 1e-9
     assert abs(seen.get("model", 0.0) - 0.02) < 1e-9
+
+
+def test_transient_readback_miss_is_retried_not_falsely_unverifiable():
+    # A one-off read-back hiccup (snapshot returns None) on the FIRST post-send check must be RETRIED,
+    # not concluded terminal — so a live send whose Sent label hasn't indexed yet still verifies on a
+    # later attempt instead of falsely escalating "couldn't confirm it landed". (Before: a None `after`
+    # bailed the verify loop immediately, so more attempts never helped the transient-error case.)
+    class _FlakyReadback(FakeIntegrations):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.calls = 0
+
+        def snapshot(self, **kw):
+            self.calls += 1
+            if self.calls == 2:      # call 1 = pre-send baseline (ok); call 2 = first after-snapshot (miss)
+                return None
+            return super().snapshot(**kw)
+
+    integ = _FlakyReadback()
+    b = _broker(integ, verify_attempts=3, verify_delay=0.0)
+    params = {"to": "bob@acme.com", "subject": "hi", "body": "x"}
+    gk = b.grant_key_for("gmail", "GMAIL_SEND_EMAIL", params)
+    res = b.call_integration(toolkit="gmail", action="GMAIL_SEND_EMAIL", params=params,
+                             user_id="u1", grants={gk})
+    assert res.ok and res.effect.phase == "forwarded"
+    assert res.effect.expected_present is True     # retried PAST the transient miss -> verified
+    assert integ.calls >= 3                         # baseline + at least two after-attempts
+
+
+def test_persistent_readback_failure_stays_unverifiable():
+    # If EVERY post-send read-back errors, it settles honestly on unverifiable (None) — never fabricated.
+    class _DeadReadback(FakeIntegrations):
+        def snapshot(self, **kw):
+            return None
+
+    b = _broker(_DeadReadback(), verify_attempts=3, verify_delay=0.0)
+    params = {"to": "bob@acme.com", "subject": "hi", "body": "x"}
+    gk = b.grant_key_for("gmail", "GMAIL_SEND_EMAIL", params)
+    res = b.call_integration(toolkit="gmail", action="GMAIL_SEND_EMAIL", params=params,
+                             user_id="u1", grants={gk})
+    assert res.ok and res.effect.expected_present is None      # no baseline/read-back -> unverifiable

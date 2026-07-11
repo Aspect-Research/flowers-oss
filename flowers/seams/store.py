@@ -157,6 +157,8 @@ def _approval_to_dict(a: ApprovalRequest) -> dict:
         "options": list(a.options),
         "tier": a.tier,
         "effect_label": a.effect_label,
+        "reason_code": a.reason_code,
+        "subject_keys": list(a.subject_keys),
         "id": a.id,
         "ts": a.ts,
     }
@@ -170,6 +172,8 @@ def _approval_from_dict(d: dict) -> ApprovalRequest:
         options=list(d.get("options", [])),
         tier=d.get("tier"),
         effect_label=d.get("effect_label", ""),
+        reason_code=d.get("reason_code", ""),
+        subject_keys=tuple(d.get("subject_keys", ())),
         id=d["id"],
         ts=d["ts"],
     )
@@ -187,6 +191,8 @@ def _run_to_dict(r: RunState) -> dict:
         "pending_approval": _approval_to_dict(r.pending_approval) if r.pending_approval is not None else None,
         "mandate": dict(r.mandate or {}),
         "mandate_counts": dict(r.mandate_counts or {}),
+        "mandate_auto": bool(r.mandate_auto),
+        "fast_path": bool(r.fast_path),
         "deadline_ts": r.deadline_ts,
         "created_at": r.created_at,
         "updated_at": r.updated_at,
@@ -206,6 +212,8 @@ def _run_from_dict(d: dict) -> RunState:
         pending_approval=_approval_from_dict(pa) if pa is not None else None,
         mandate=dict(d.get("mandate") or {}),
         mandate_counts=dict(d.get("mandate_counts") or {}),
+        mandate_auto=bool(d.get("mandate_auto", False)),
+        fast_path=bool(d.get("fast_path", False)),
         deadline_ts=d.get("deadline_ts"),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
@@ -415,6 +423,27 @@ class SqliteStore:
                 "SELECT data FROM effects WHERE run_id = ? ORDER BY seq", (run_id,)
             ).fetchall()
         return [_effect_from_dict(json.loads(r["data"])) for r in rows]
+
+    def update_effect(self, run_id: str, effect: EffectRecord) -> bool:
+        """Overwrite the stored effect row whose ``action_id`` matches ``effect``, IN PLACE, with this
+        (corrected) record. The effect log stays ONE row per action, and that row is the LATEST
+        OBSERVATION of it: when a stronger, later signal arrives about a side-effect (an owner attestation
+        that a send did or did NOT land), correcting that single record IS the honest current state — not
+        a second, contradictory forwarded row that every grant_key-keyed consumer (the operator's
+        idempotency re-seed) would then have to terminal-dedup. The HOW-we-learned-it trail survives in the
+        durable events log. Returns True iff a matching row was found and rewritten. Used only by the
+        operator's owner-confirmed / owner-reported-missing corrections (P0.2)."""
+        with self._locked() as c:
+            rows = c.execute(
+                "SELECT seq, data FROM effects WHERE run_id = ? ORDER BY seq", (run_id,)
+            ).fetchall()
+            for r in rows:
+                if json.loads(r["data"]).get("action_id") == effect.action_id:
+                    c.execute("UPDATE effects SET data = ? WHERE seq = ?",
+                              (json.dumps(_effect_to_dict(effect)), r["seq"]))
+                    c.commit()
+                    return True
+        return False
 
     # --- events (the durable owner-facing per-run log the dashboard replays) ---
 

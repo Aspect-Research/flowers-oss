@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 
 from flowers import memory as user_memory
+from flowers import runtime
 from flowers.types import Goal
 
 _CLARIFIER_SYSTEM = """You are the intake step of an autonomous operator. Before planning, identify ONLY
@@ -49,8 +50,11 @@ class Clarifier:
             # Inject what we already know about the user so the clarifier does NOT re-ask it (the whole
             # point of cross-session memory — a returning user shouldn't be asked something we already know).
             blob = f"GOAL: {goal.text}" + user_memory.format_for_prompt(memory)
+            style = runtime.reply_style()
+            system = _CLARIFIER_SYSTEM + (f"\n\nSTYLE for the questions you ask the owner: {style}"
+                                          if style else "")
             resp = client.complete(
-                [{"role": "system", "content": _CLARIFIER_SYSTEM},
+                [{"role": "system", "content": system},
                  {"role": "user", "content": blob}],
                 role="planner", response_format=_QUESTIONS_RESPONSE_FORMAT)
             data = json.loads(resp.content)

@@ -81,4 +81,4 @@ def test_approval_prompt_shows_the_verification_channel():
         action="submit", params={"ref": "X", "url": "https://v.com/book", "observe_url": "https://v.com/confirm"},
         user_id="u1")
     assert res.status == "needs_approval"
-    assert "verify via" in (res.approval.prompt or "") and "v.com/confirm" in res.approval.prompt
+    assert "confirm it via" in (res.approval.prompt or "") and "v.com/confirm" in res.approval.prompt

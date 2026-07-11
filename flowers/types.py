@@ -82,6 +82,10 @@ class EffectRecord:
     toolkit: str
     action: str
     side_effecting: bool | None = None
+    # Does this action MUTATE external state? Default True (strict). A non-mutating fetch/read (e.g. a
+    # repo clone into a private sandbox) sets this False: a FAILED such attempt leaves no external
+    # footprint, so it must not poison a run the way a failed send/create/delete does (see trustgate).
+    mutating: bool = True
     phase: str = "attempted"
     drift_present: bool | None = None
     expected_present: bool | None = None
@@ -101,6 +105,7 @@ class EffectRecord:
             "toolkit": self.toolkit,
             "action": self.action,
             "side_effecting": self.side_effecting,
+            "mutating": self.mutating,
             "phase": self.phase,
             "drift_present": self.drift_present,
             "expected_present": self.expected_present,
@@ -205,11 +210,22 @@ class ApprovalRequest:
     """A single owner-facing question the run parks on: clarifying questions, a side-effect to
     authorize, the autonomy-mandate card, an undo confirmation, or an escalation review."""
     run_id: str
-    kind: str                       # "clarify" | "side_effect" | "never" | "undo" | "mandate" | "review"
+    kind: str      # "clarify"|"side_effect"|"never"|"undo"|"mandate"|"review"|"preview" (P0.3b draft)
     prompt: str
     options: list[str] = field(default_factory=list)
     tier: str | None = None      # for side_effect/never: the policy tier
     effect_label: str = ""          # for side_effect/never: toolkit:action
+    # For a "review" escalation: the machine tag _escalate stamped (needs_owner_confirm /
+    # reverify_proven_missing / owner_declined / budget_exhausted / ...), carried on the parked question
+    # so the resume handler can branch on WHY the run escalated without parsing the prose. Default "".
+    reason_code: str = ""
+    # For a send-confirmation escalation: the ``action_id``s of the EXACT effect records this escalation
+    # is about — the plain-unverifiable sends it asked the owner to confirm (needs_owner_confirm), or the
+    # single proven-missing send (reverify_proven_missing). The resume handler flips/attests ONLY these,
+    # never a sibling effect (e.g. a verification_broken send on its own +60s reverify track). Empty on a
+    # non-send escalation or a run persisted before this field existed (then the handler falls back to a
+    # predicate). Default empty tuple.
+    subject_keys: tuple[str, ...] = ()
     id: str = field(default_factory=lambda: new_id("apr"))
     ts: float = field(default_factory=now_ts)
 
@@ -233,6 +249,18 @@ class RunState:
     # flowers.mandate. Both must round-trip in store._run_to_dict / _run_from_dict (field-explicit).
     mandate: dict = field(default_factory=dict)
     mandate_counts: dict = field(default_factory=dict)
+    # True iff ``mandate`` was AUTO-COMMITTED because the goal itself authorized it (OWNER-GRANT, P0.3a) —
+    # the owner never saw an autonomy card. Drives the draft-preview single touch (P0.3b): an auto-committed
+    # delivering send is surfaced as a draft to confirm, whereas a card-APPROVED mandate (owner already saw
+    # the plan) sends silently. False for a card-approved / no mandate. Round-trips (store, field-explicit).
+    mandate_auto: bool = False
+    # True iff this run took the SINGLE-ACTION FAST PATH (P1.3): a self-contained 'email <one named
+    # address> saying <content>' that skipped the clarifier + planner LLM calls for a deterministic
+    # compose->send template plan. Drives the one behavioural difference at finish — the independent
+    # completion verifier is SKIPPED (the detector guarantees no fuzzy/hard constraints, and the send is
+    # already read-back-verified mechanically) — so the happy path costs <=2 model calls. Round-trips
+    # (store, field-explicit) so a restart mid-preview still skips the verifier on resume.
+    fast_path: bool = False
     # Wall-clock relentlessness budget: an absolute wake-by timestamp (timers clock). None = no time bound.
     # The give-up sites keep trying until budget OR this deadline is exhausted (then escalate honestly).
     deadline_ts: float | None = None

@@ -282,6 +282,13 @@ def classify_effects(
                 unverified.append(label)        # independent read-back shows NO change -> not supported
             else:
                 unverifiable.append(label)      # drift True/None, no fingerprint -> ask the owner
+        elif phase == "failed" and rec.get("mutating", True) is False:
+            # A cleanly-FAILED NON-mutating fetch (e.g. a repo clone that errored on a bad slug before the
+            # agent resolved the right one). The adapter itself reported failure AND nothing external was
+            # touched, so there is no effect to fabricate and nothing to leak — it is honest history, not a
+            # claimed-but-absent effect. It never poisons the run. (Mutating failures fall through to the
+            # strict same-identity rule below: a failed send/create/delete is NEVER silently forgiven.)
+            continue
         elif phase in ("failed", "attempted"):
             # A genuinely retryable attempt while the run claims done. A retry is normal: if a LATER
             # record of the SAME action (matched by grant_key identity) verifiably landed, this attempt
@@ -300,12 +307,16 @@ def classify_effects(
     return sorted(set(unverified)), sorted(set(unverifiable))
 
 
-def verified_effects(actions: list[dict]) -> list[str]:
-    """The labels of side-effecting effects the gate considers VERIFIED-as-landed — using the SAME
-    per-record rules ``classify_effects`` uses to *not* flag a record. This is the single source of
-    truth an objective ``effect_landed`` check must consult; the operator must never re-derive
-    "what landed" on its own (a non-side-effecting / unverified record can never count as landed).
-    Pure, no I/O, no LLM."""
+def _forwarded_labels(actions: list[dict], *, strict: bool) -> list[str]:
+    """Shared core of ``verified_effects`` (strict) and ``landed_effects`` (relaxed). Walks the terminal
+    record per action and collects the labels of side-effecting, forwarded, not-proven-missing effects.
+
+    The ONLY difference is the composio-integration acceptance bar:
+      * ``strict=True``  -> only a PRECISE expected fingerprint counts (``expected_present is True``).
+      * ``strict=False`` -> forwarded-and-not-proven-missing counts (``True`` OR unverifiable ``None``).
+    The CUA/browser provenance path is ALWAYS strict either way — a self-reported browser action can
+    never satisfy a done-check on its own word; only an independent observer's confirmed fingerprint
+    does. Pure, no I/O, no LLM."""
     terminal: dict[str, dict] = {}
     order: list[str] = []
     for rec in actions:
@@ -314,7 +325,7 @@ def verified_effects(actions: list[dict]) -> list[str]:
         if aid not in terminal:
             order.append(aid)
         terminal[aid] = rec
-    verified: list[str] = []
+    out: list[str] = []
     for aid in order:
         rec = terminal[aid]
         side_effecting = rec.get("side_effecting")
@@ -324,15 +335,38 @@ def verified_effects(actions: list[dict]) -> list[str]:
         if not side_effecting or rec.get("phase") != "forwarded":
             continue
         if _is_self_sourced(rec) or rec.get("expected_present") is False:
-            continue
+            continue                          # proven-missing / self-sourced never counts (both modes)
         label = f"{rec.get('toolkit', '?')}:{rec.get('action', '?')}"
         if _requires_provenance(rec):
             if rec.get("expected_present") is True and _has_independent_provenance(rec):
-                verified.append(label)        # CUA/browser: only the fingerprint via an independent observer
+                out.append(label)             # CUA/browser: only the fingerprint via an independent observer
             continue
-        if rec.get("expected_present") is True:
-            verified.append(label)            # composio: verified ONLY by the precise expected fingerprint
-    return sorted(set(verified))
+        if strict:
+            if rec.get("expected_present") is True:
+                out.append(label)             # composio: verified ONLY by the precise expected fingerprint
+        else:
+            out.append(label)                 # composio: forwarded & not proven-missing (True or unverifiable)
+    return sorted(set(out))
+
+
+def verified_effects(actions: list[dict]) -> list[str]:
+    """The labels of side-effecting effects the gate considers VERIFIED-as-landed — independently
+    confirmed by the precise expected fingerprint. This is what the run's final "verified effects"
+    report surfaces and what the fabrication gate treats as proven. An unverifiable (no reliable
+    read-back) effect is NOT here. Pure, no I/O, no LLM."""
+    return _forwarded_labels(actions, strict=True)
+
+
+def landed_effects(actions: list[dict]) -> list[str]:
+    """The labels an ``effect_landed`` done-check must consult: side-effecting effects that were
+    FORWARDED to the provider and NOT proven-missing — i.e. verified OR honestly unverifiable (the
+    provider accepted the call but no reliable read-back exists to independently confirm it). A
+    proven-missing effect (``expected_present is False``) is excluded, so a genuinely-dropped send
+    still fails the check and legitimately retries. This is DELIBERATELY looser than
+    ``verified_effects``: the action already went out, so demanding independent confirmation before
+    calling the step done would force a blind retry — a duplicate send. The broker's own idempotency
+    (it never re-sends a forwarded-and-not-proven-missing action) rests on the same rule. Pure."""
+    return _forwarded_labels(actions, strict=False)
 
 
 # ----------------------------------------------------- objective "done" checks
@@ -424,12 +458,15 @@ def _objective_check_one(kind: str, params: dict, files: list, texts: dict,
         return ok, ("" if ok else f"{path} does not contain the required pattern "
                     f"{params.get('pattern', '')!r}")
     if kind == "effect_landed":
-        # A non-filesystem deliverable: a named side-effect (toolkit:action) must be VERIFIED in the
-        # effect log. The bundle carries ``verified_effects`` (labels the gate confirmed landed).
+        # A non-filesystem deliverable: a named side-effect (toolkit:action) must have LANDED in the
+        # effect log. The bundle carries ``landed_effects`` (labels that were forwarded and not
+        # proven-missing — verified OR honestly unverifiable). A proven-missing send is absent here, so
+        # it still fails and retries; an unverifiable-but-forwarded one passes, so we don't blind-retry
+        # (double-send) something the provider already accepted.
         want = str(params.get("label", ""))
-        verified = set(params.get("_verified_effects", []))  # injected by the operator at finish
-        return (want in verified), ("" if want in verified
-                                    else f"the required effect {want} has not been verified as landed")
+        landed = set(params.get("_landed_effects", []))  # injected by the operator at finish
+        return (want in landed), ("" if want in landed
+                                  else f"the required effect {want} did not land (no send was forwarded)")
     return False, f"unknown objective-check kind {kind!r} (treated as unmet — fail toward refusing)"
 
 
@@ -438,7 +475,10 @@ def _objective_iter(criteria: list, bundle: dict):
     files = list((bundle or {}).get("files") or [])
     texts = dict((bundle or {}).get("texts") or {})
     fetched = set((bundle or {}).get("fetched_urls") or [])
-    verified_effects = list((bundle or {}).get("verified_effects") or [])
+    # ``landed_effects`` is what effect_landed rests on; accept the legacy ``verified_effects`` key too
+    # (older bundles / direct callers) so a strict-verified label still satisfies the check.
+    landed_effects = list((bundle or {}).get("landed_effects")
+                          or (bundle or {}).get("verified_effects") or [])
     for c in criteria or []:
         if not isinstance(c, dict):
             continue
@@ -449,7 +489,7 @@ def _objective_iter(criteria: list, bundle: dict):
         kind = str(check.get("kind"))
         params = dict(check.get("params")) if isinstance(check.get("params"), dict) else {}
         if kind == "effect_landed":
-            params["_verified_effects"] = verified_effects  # let the check see what the gate confirmed
+            params["_landed_effects"] = landed_effects  # let the check see what actually landed
         ok, detail = _objective_check_one(kind, params, files, texts, fetched)
         yield cid, ok, detail
 

@@ -135,23 +135,68 @@ def fingerprint_for(toolkit: str, action: str, params: dict) -> dict | None:
     return fp or None
 
 
+# The offline model of the live NON-retryable read-back failure (root cause A, 2026-07-08): Arcade made
+# Gmail.ListEmailsByHeader.recipient list-typed, so the string we sent 400'd every Sent read-back. Shaped
+# exactly as ArcadeIntegrations._error now emits it — the structured ``nonretryable=true kind=… status=…``
+# header (can_retry=False) — so flowers.broker._nonretryable_readback classifies it from STRUCTURE.
+_READBACK_FAULT_MSG = ("nonretryable=true kind=TOOL_RUNTIME_BAD_INPUT_VALUE status=400: ToolInputError: "
+                       "Invalid input: recipient: Input should be a valid list")
+# The offline model of a RETRYABLE read-back failure (a transient upstream blip / rate-limit): the
+# read-back TOOL is fine, it just hiccuped, so ``can_retry`` is True and there is NO nonretryable header.
+# The message deliberately carries "retry after 4220ms" — the 422/400 digits in that free text must NOT
+# trip the structural classifier, so the verify loop rides it out and the send settles PLAIN unverifiable.
+_READBACK_RETRYABLE_MSG = ("kind=TOOL_RUNTIME_RETRY status=503: upstream temporarily unavailable, "
+                           "retry after 4220ms")
+
+
 class FakeIntegrations:
     """An in-memory, fully offline integrations backend for the engine + tests.
 
     State is per user: ``{user_id: {resource: {item_id: fields}}}``. Construct with:
       * ``drop_actions`` — a set of (toolkit, ACTION) tuples whose ``execute`` returns ok but does NOT
         land the effect (simulates a provider that accepted the call but nothing appeared) — the
-        fabricated-completion case the gate must refuse;
+        fabricated-completion case the gate must refuse. For a send this is the PROVEN-MISSING case:
+        the read-back runs fine and shows the message absent;
       * ``no_readback`` — toolkits with no read-back surface (``snapshot`` returns None -> unverifiable).
+
+    Verification fault-injection (offline models of the live failure modes P0.1 hardens against):
+      * ``readback_errors`` — (toolkit, ACTION) tuples whose VERIFICATION read-back (``snapshot_probe``)
+        fails with a NON-retryable, schema/BAD_INPUT-shaped error (the live root-cause-A shape) instead
+        of returning a surface -> the broker records ``verification_broken`` (loud, re-checked on a
+        timer), NOT a silent "unverifiable" owner chore. ``heal_readback_errors()`` clears the fault
+        (models the read-back tool coming back / the schema being fixed) so a +60s re-check can run.
+      * ``readback_retryable_errors`` — (toolkit, ACTION) tuples whose VERIFICATION read-back errors
+        RETRYABLY (a transient upstream blip — ``_READBACK_RETRYABLE_MSG``, no nonretryable header). The
+        BASELINE read-back (the first probe) is let through so the verify loop actually runs; every
+        VERIFY poll after it then errors, modelling a tool that was healthy at baseline and went briefly
+        unavailable right after the send. The broker must ride out all attempts and settle PLAIN
+        unverifiable (the pre-P0.1 behaviour), NEVER the loud ``verification_broken``.
+      * ``readback_lag`` — ``{(toolkit, ACTION): n}``: the just-written item is HIDDEN from the read-back
+        for its first ``n`` polls, then appears — the provider-index-lag case (e.g. Gmail's Sent label
+        settling a few seconds behind the send). A verify loop with enough attempts still verifies it;
+        too few settles on proven-missing (unchanged loop semantics).
     """
 
-    def __init__(self, *, drop_actions=(), no_readback=(), unauthorized=()):
+    def __init__(self, *, drop_actions=(), no_readback=(), unauthorized=(),
+                 readback_errors=(), readback_retryable_errors=(), readback_lag=None):
         self._state: dict[str, dict[str, dict[str, dict]]] = {}
         self._drop = {(_key(t, a)) for (t, a) in drop_actions}
         self._no_readback = {(t or "").lower() for t in no_readback}
         # toolkits the user has NOT yet connected: execute() fails with authorization_required and
         # authorize() returns a (pending, url) — the offline model of the OAuth connect round-trip.
         self._unauthorized = {(t or "").lower() for t in unauthorized}
+        # (toolkit, ACTION) -> the read-back probe errors non-retryably (verification_broken). Mutable
+        # so a test can heal it mid-scenario (see ``heal_readback_errors``) to exercise the +60s re-check.
+        self._readback_errors = {(_key(t, a)) for (t, a) in readback_errors}
+        # (toolkit, ACTION) -> the read-back probe errors RETRYABLY on every VERIFY poll (the baseline
+        # probe is let through), modelling a transient blip the verify loop must ride out -> plain
+        # unverifiable, never verification_broken. ``_probe_calls`` counts per-key probes so the first
+        # (the pre-effect baseline) passes and only the subsequent verification polls fail.
+        self._readback_retryable = {(_key(t, a)) for (t, a) in readback_retryable_errors}
+        self._probe_calls: dict[str, int] = {}
+        # (toolkit, ACTION) -> polls the just-written item stays hidden from the read-back (index lag).
+        self._readback_lag = {(_key(t, a)): int(n) for (t, a), n in dict(readback_lag or {}).items()}
+        self._lag_hide: dict[str, int] = {}   # item_id -> polls still hidden (aged out on each snapshot)
         self._counter = 0
 
     # ---- helpers ----
@@ -188,6 +233,16 @@ class FakeIntegrations:
         """Test helper: simulate the user COMPLETING the connect flow for a toolkit (the OAuth grant lands)."""
         self._unauthorized.discard((toolkit or "").lower())
 
+    def heal_readback_errors(self, *actions) -> None:
+        """Test helper: clear the ``readback_errors`` fault (all, or the given (toolkit, ACTION) keys) —
+        models the read-back tool recovering / the drifted schema being fixed, so a broker/operator
+        re-check (+60s timer) can now observe the surface and settle verified vs proven-missing."""
+        if actions:
+            for (t, a) in actions:
+                self._readback_errors.discard(_key(t, a))
+        else:
+            self._readback_errors.clear()
+
     # ---- Protocol ----
     def execute(self, *, toolkit: str, action: str, params: dict, user_id: str) -> ExecResult:
         params = params or {}
@@ -215,6 +270,9 @@ class FakeIntegrations:
         else:
             iid = self._next_id()
         self._resource(user_id, resource)[iid] = fields
+        lag = self._readback_lag.get(_key(toolkit, action), 0)
+        if lag > 0:
+            self._lag_hide[iid] = lag   # hide it from the read-back for the next `lag` polls (index lag)
         return ExecResult(ok=True, data={"id": iid})
 
     def snapshot(self, *, toolkit: str, action: str, params: dict, user_id: str) -> dict | None:
@@ -226,7 +284,35 @@ class FakeIntegrations:
         if entry is None:
             return None
         _kind, resource = entry
-        return self.surface(user_id, resource)
+        surf = self.surface(user_id, resource)
+        if self._lag_hide:
+            # Age out lagging items: an item still within its lag window is HIDDEN from this read-back
+            # (and its countdown decremented), so it appears only after `lag` polls — the provider
+            # index-lag model. Only items currently present in this surface age.
+            visible: dict[str, dict] = {}
+            for iid, item in surf.items():
+                n = self._lag_hide.get(iid, 0)
+                if n > 0:
+                    self._lag_hide[iid] = n - 1
+                    continue
+                visible[iid] = item
+            surf = visible
+        return surf
+
+    def snapshot_probe(self, *, toolkit: str, action: str, params: dict, user_id: str):
+        """Read-back probe for the broker's VERIFICATION path -> ``(surface, error)``. A key under the
+        ``readback_errors`` fault returns ``(None, <non-retryable schema/BAD_INPUT error>)`` — the live
+        root-cause-A shape — so the broker records ``verification_broken`` rather than silently escalating
+        an "unverifiable" owner chore. Otherwise delegates to ``snapshot`` (so a subclass that overrides
+        ``snapshot`` — e.g. a flaky/dead read-back — still drives this)."""
+        key = _key(toolkit, action)
+        if key in self._readback_errors:
+            return None, _READBACK_FAULT_MSG
+        if key in self._readback_retryable:
+            self._probe_calls[key] = self._probe_calls.get(key, 0) + 1
+            if self._probe_calls[key] > 1:   # baseline (1st probe) passes; the verify polls error
+                return None, _READBACK_RETRYABLE_MSG
+        return self.snapshot(toolkit=toolkit, action=action, params=params, user_id=user_id), None
 
     def fingerprint(self, *, toolkit: str, action: str, params: dict) -> dict | None:
         return fingerprint_for(toolkit, action, params or {})
@@ -294,6 +380,20 @@ def _msg_id(p: dict) -> str:
     return p.get("email_id") or p.get("message_id") or p.get("id") or ""
 
 
+def _as_str_list(v) -> list:
+    """Wrap a scalar in a single-element list for Arcade's ARRAY-typed header-search fields. On
+    ``Gmail.ListEmailsByHeader`` the ``sender``/``recipient``/``subject``/``body`` filters are
+    ``array<string>`` (NOT ``string``) — confirmed live against Gmail@8.0.1 on 2026-07-08; passing a
+    bare string 400s with ``TOOL_RUNTIME_BAD_INPUT_VALUE: Input should be a valid list``. An empty/None
+    value yields ``[]`` (so the caller's ``v not in (None, "", [])`` filter drops it), a list passes
+    through. See the Arcade-schema-drift note on ``_ARCADE_TOOLS``."""
+    if v in (None, ""):
+        return []
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v if str(x).strip()]
+    return [str(v)]
+
+
 def _parse_events(val) -> dict[str, dict]:
     if isinstance(val, dict):
         events = val.get("events") or val.get("items") or []
@@ -318,6 +418,17 @@ def _parse_events(val) -> dict[str, dict]:
 # NOTE: Gmail (send + Sent read-back) and Google Calendar (create + ListEvents read-back) are
 # live-verified end to end. Any OTHER toolkit's tool/field names are INDICATIVE — confirm them against
 # the live Arcade catalog when that toolkit is first connected, same as the model slugs.
+#
+# KNOWN HAZARD — Arcade schema drift. Arcade revs its tool input contracts under our feet, and a shape
+# that worked yesterday can start 400ing with TOOL_RUNTIME_BAD_INPUT_VALUE (a NON-retryable error): a
+# read-back that silently 400s degrades to a None snapshot, and (before the broker learned to tell them
+# apart) every send then read as "unverifiable" and falsely escalated to the owner. Re-audit these
+# shapes against the live catalog (`client.tools.get(name=...)`) whenever verification starts failing.
+# LAST AUDITED 2026-07-08 against Gmail@8.0.1 + GoogleCalendar@3.5.0: `Gmail.ListEmailsByHeader`'s
+# sender/recipient/subject/body filters are ARRAY<string> (a bare string 400s — this is root cause A);
+# `Gmail.SendEmail.recipient` is a plain string; TrashEmail/ChangeEmailLabels/CreateEvent/ListEvents
+# shapes below all match live. The broker now records a non-retryable read-back 400 as a distinct
+# ``verification_broken`` state (loud + re-checked on a timer), never a silent owner chore.
 _ARCADE_TOOLS: dict[tuple[str, str], dict] = {
     ("gmail", "GMAIL_SEND_EMAIL"): {
         "tool": "Gmail.SendEmail",
@@ -327,9 +438,11 @@ _ARCADE_TOOLS: dict[tuple[str, str], dict] = {
             "subject": p.get("subject", "") or "",
             "body": p.get("body") or p.get("subject", "") or "",
         },
-        # read the SENT label filtered to this recipient -> the new message shows up as an added item
+        # read the SENT label filtered to this recipient -> the new message shows up as an added item.
+        # ``recipient`` is Arcade's ARRAY<string> header filter (list-typed — see the schema-drift note
+        # above; a bare string 400s), so wrap the address in a single-element list.
         "readback": lambda p: ("Gmail.ListEmailsByHeader",
-                               {"recipient": p.get("to") or p.get("recipient") or "",
+                               {"recipient": _as_str_list(p.get("to") or p.get("recipient")),
                                 "label": "SENT", "max_results": 25}),
         "parse": _parse_emails,
     },
@@ -342,11 +455,14 @@ _ARCADE_TOOLS: dict[tuple[str, str], dict] = {
         # server-side filtered fetch -> "summarize my unread from boss" / "find the thread about X".
         # A READ (AUTO): execute returns the matching emails; the await/monitor loop can also snapshot it.
         "tool": "Gmail.ListEmailsByHeader", "kind": "read",
+        # sender/recipient/subject/body are ARRAY<string> on ListEmailsByHeader (list-typed — see the
+        # schema-drift note above; a bare string 400s), so wrap each in a list; date_range/label stay
+        # scalar strings. Empties collapse to [] and are filtered out.
         "to_input": lambda p: {k: v for k, v in {
-            "sender": p.get("sender") or p.get("from") or "",
-            "recipient": p.get("recipient") or p.get("to") or "",
-            "subject": p.get("subject") or "",
-            "body": p.get("body") or p.get("query") or "",
+            "sender": _as_str_list(p.get("sender") or p.get("from")),
+            "recipient": _as_str_list(p.get("recipient") or p.get("to")),
+            "subject": _as_str_list(p.get("subject")),
+            "body": _as_str_list(p.get("body") or p.get("query")),
             "date_range": p.get("date_range") or "",
             "label": p.get("label") or "",
             "max_results": int(p.get("max_results", 25) or 25),
@@ -435,7 +551,13 @@ class ArcadeIntegrations:
     def available(self) -> bool:
         if self._client is not None:
             return True
-        return runtime.adapter_available(key_env="ARCADE_API_KEY")
+        if not runtime.adapter_available(key_env="ARCADE_API_KEY"):
+            return False
+        # The SDK is an optional dependency imported lazily in _arcade(). If it is absent, report
+        # UNAVAILABLE so the router falls back to the Fake seam, rather than letting the key alone
+        # promise a live integration that then escalates every run with ModuleNotFoundError.
+        import importlib.util
+        return importlib.util.find_spec("arcadepy") is not None
 
     def _arcade(self):
         if self._client is not None:
@@ -457,14 +579,31 @@ class ArcadeIntegrations:
         """Arcade can report ``success=True`` while the WRAPPED tool failed: ``output.error`` is set (e.g.
         a GitHub 403, a retryable runtime error). That is NOT a success — surface it as the error string so
         a failed write is treated as failed (the gate would refuse it anyway via read-back, but a buried
-        error must not read as ok). Returns the message, or None when the call genuinely succeeded."""
+        error must not read as ok). Returns the message, or None when the call genuinely succeeded.
+
+        When Arcade gives us a STRUCTURED ``OutputError`` (``can_retry``/``kind``/``status_code``), prepend
+        a stable, machine-readable header — ``nonretryable=true kind=<KIND> status=<CODE>: <message>`` — so
+        the broker classifies a broken read-back from its STRUCTURE, never by scraping status digits out of
+        free text (a transient "retry after 4220ms" or a 422-bearing trace id must stay RETRYABLE; see
+        flowers.broker._nonretryable_readback). ``nonretryable=true`` is emitted ONLY when ``can_retry`` is
+        explicitly False — the one signal that says retrying can't help."""
         out = getattr(resp, "output", None)
         err = getattr(out, "error", None) if out is not None else None
         if err is None and getattr(resp, "success", True) is False:
             return "tool reported failure"
         if err is None:
             return None
-        return getattr(err, "message", None) or str(err)
+        msg = getattr(err, "message", None) or str(err)
+        prefix: list[str] = []
+        if getattr(err, "can_retry", None) is False:   # ONLY when Arcade explicitly says it won't help
+            prefix.append("nonretryable=true")
+        kind = getattr(err, "kind", None)
+        if kind:
+            prefix.append(f"kind={kind}")
+        status = getattr(err, "status_code", None)
+        if status is not None:
+            prefix.append(f"status={status}")
+        return f"{' '.join(prefix)}: {msg}" if prefix else msg
 
     def _exec_raw(self, tool_name: str, inp: dict, user_id: str):
         return self._arcade().tools.execute(tool_name=tool_name, input=inp, user_id=user_id)
@@ -490,9 +629,21 @@ class ArcadeIntegrations:
         return ExecResult(ok=True, data=self._value(resp), error=None)
 
     def snapshot(self, *, toolkit: str, action: str, params: dict, user_id: str) -> dict | None:
+        """The read-back surface (or None). Thin wrapper over ``snapshot_probe`` for callers that don't
+        need the error channel (e.g. the operator's await/monitor inbox poll)."""
+        surface, _err = self.snapshot_probe(toolkit=toolkit, action=action, params=params, user_id=user_id)
+        return surface
+
+    def snapshot_probe(self, *, toolkit: str, action: str, params: dict, user_id: str):
+        """Read-back probe for the broker's VERIFICATION path -> ``(surface, error)``. Same independent
+        read-back as ``snapshot``, but it no longer SWALLOWS the read-back tool's own error to a bare
+        None: it RETURNS the error string alongside, so the broker can tell a legitimately-absent
+        read-back surface (``(None, None)`` -> unverifiable, ask the owner) apart from a BROKEN read-back
+        tool (``(None, "<schema/BAD_INPUT 400>")`` -> ``verification_broken``, re-checked on a timer).
+        This is where root cause A's silent None used to erase the distinction. Never raises."""
         entry = _ARCADE_TOOLS.get(((toolkit or "").lower(), (action or "").upper()))
         if entry is None:
-            return None
+            return None, None
         # A WRITE action is read back via its INDEPENDENT `readback` tool (the gate never verifies through
         # the same call that performed the effect). A READ action (e.g. inbox fetch) IS its own surface —
         # execute its own tool and parse. The operator's await/monitor loop reads the inbox via
@@ -502,15 +653,16 @@ class ArcadeIntegrations:
         elif entry.get("kind") == "read":
             tool_name, inp = entry["tool"], entry["to_input"](params or {})
         else:
-            return None              # a write with no independent read-back -> unverifiable (ask the owner)
+            return None, None        # a write with no independent read-back -> unverifiable (ask owner)
         parse = entry.get("parse") or _parse_emails
         try:
             resp = self._exec_raw(tool_name, inp, user_id)
-            if self._error(resp) is not None:
-                return None     # the read-back call itself failed -> no reliable surface -> ask the owner
-            return parse(self._value(resp) or {})
-        except Exception:
-            return None     # a backend OR parser failure -> no reliable read-back -> unverifiable (ask owner)
+            err = self._error(resp)
+            if err is not None:
+                return None, err     # the read-back tool itself errored -> surface it, don't hide it
+            return parse(self._value(resp) or {}), None
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
 
     def fingerprint(self, *, toolkit: str, action: str, params: dict) -> dict | None:
         return fingerprint_for(toolkit, action, params or {})

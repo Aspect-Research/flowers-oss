@@ -47,6 +47,14 @@ def env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
+def reply_style() -> str:
+    """An optional owner-facing OUTPUT-STYLE directive (``FLOWERS_REPLY_STYLE``) appended to the
+    executor/clarifier system prompts. Empty by default (unchanged behaviour). A channel that talks to
+    the owner as chat (e.g. a messaging-app front end) sets this so deliverables and questions read like
+    a person texting, without touching the channel-agnostic core."""
+    return env("FLOWERS_REPLY_STYLE")
+
+
 def load_dotenv(path: str = ".env") -> int:
     """Populate ``os.environ`` from a ``.env`` file of ``KEY=VALUE`` lines, if present.
 

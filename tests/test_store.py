@@ -54,6 +54,28 @@ def test_run_round_trip_with_enum_status():
     assert got2.spent_usd == 2.5
 
 
+def test_fast_path_flag_round_trips(tmp_path):
+    """RunState.fast_path (P1.3) must survive save_run/get_run AND a process restart — the field-explicit
+    serializer trap: a fast-path run parked mid-preview still skips the finish-time verifier on resume."""
+    db = str(tmp_path / "fast.db")
+    s1 = SqliteStore(db)
+    run = RunState(run_id="run_fp", goal_text="g", budget_usd=1.0)
+    s1.create_run(run)
+    assert s1.get_run("run_fp").fast_path is False       # default when never set
+
+    run.fast_path = True
+    s1.save_run(run)                                     # the flip persists via save_run
+    assert s1.get_run("run_fp").fast_path is True
+    s1.close()
+
+    s2 = SqliteStore(db)
+    assert s2.get_run("run_fp").fast_path is True         # ...and across a reopen (process restart)
+    # a pre-P1.3 row (no such column value) rehydrates to the safe default, never a KeyError
+    s2.create_run(RunState(run_id="run_old_fp", goal_text="g", budget_usd=1.0))
+    assert s2.get_run("run_old_fp").fast_path is False
+    s2.close()
+
+
 def test_unknown_step_kind_degrades_to_generic():
     # a plan persisted by NEWER code with a StepKind this build doesn't know must still LOAD (degrade to
     # GENERIC), not raise — mirroring the planner's _coerce_kind (Part II forward/back-compat hardening).

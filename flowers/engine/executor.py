@@ -20,6 +20,7 @@ import json
 
 from flowers import mandate as mandate_lib
 from flowers import memory as user_memory
+from flowers import runtime
 from flowers.broker import Broker, BrokerResult
 from flowers.engine.scheduler import CircuitBreaker, SemanticBudget
 from flowers.seams.interfaces import Sandbox
@@ -163,7 +164,11 @@ class Executor:
                 blob += ("\n\nWHAT EARLIER STEPS ALREADY PRODUCED (use these — do not redo them):\n" + done)
         if feedback:
             blob += f"\n\nPRIOR ATTEMPT WAS REJECTED — fix this and try again: {feedback}"
-        messages = [{"role": "system", "content": _EXECUTOR_SYSTEM}, {"role": "user", "content": blob}]
+        system = _EXECUTOR_SYSTEM
+        style = runtime.reply_style()
+        if style:
+            system += f"\n\n- OWNER-FACING REPLY STYLE (applies to your finish() summary/deliverable and any\n  `describe` you write): {style}"
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": blob}]
         return self._loop(messages, broker=broker, sandbox=sandbox, grants=grants or set(),
                           user_id=user_id, cb=CircuitBreaker(self.budget.max_consecutive_failures),
                           searches=0, tool_calls=0, effects=[], events=[], role=role)

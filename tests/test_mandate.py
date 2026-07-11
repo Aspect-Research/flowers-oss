@@ -308,6 +308,12 @@ def test_parse_mandate_carries_undo_seconds():
 # --------------------------------------------------------------------------- render
 
 def test_render_card_and_empty():
-    assert "approve" in m.render_card(_MANDATE).lower()
-    assert "GMAIL_SEND_EMAIL" in m.render_card(_MANDATE)
+    card = m.render_card(_MANDATE)
+    low = card.lower()
+    # conversational: plain-English verb, real recipients, the cap, a yes/no close — and NO raw slug/JSON.
+    assert "send the email" in low
+    assert "@acme.com" in card and "named@x.com" in card
+    assert "5 sends" in low
+    assert "yes" in low and "no" in low
+    assert "GMAIL_SEND_EMAIL" not in card and "{" not in card
     assert "ask before each action" in m.render_card({}).lower()

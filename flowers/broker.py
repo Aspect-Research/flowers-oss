@@ -16,7 +16,6 @@ is built from an independent observation, never the executor's word.
 
 from __future__ import annotations
 
-import json
 import re
 import time
 from collections.abc import Callable
@@ -114,6 +113,74 @@ def _is_auth_required(err: str | None) -> bool:
     return "authorization_required" in low or "authorization required" in low
 
 
+# A read-back error whose SHAPE says the read-back TOOL is broken — its input contract drifted, or the
+# provider rejected our call as malformed (a BAD_INPUT) — NOT a transient blip. Retrying it is pointless
+# (it will fail identically), so it becomes the loud ``verification_broken`` state (re-checked on a
+# timer), never a silent "unverifiable" the owner is asked to confirm. Root cause A (2026-07-08): Arcade
+# made Gmail.ListEmailsByHeader.recipient list-typed; the string we sent 400'd EVERY Sent read-back, so
+# every send falsely escalated "couldn't confirm — can you double-check?" to the owner.
+#
+# Classified from STRUCTURE, never from bare status digits: Arcade hands us ``can_retry`` (surfaced as
+# the ``nonretryable=true`` header — see ArcadeIntegrations._error) and a ``kind`` like
+# TOOL_RUNTIME_BAD_INPUT_VALUE. These markers are schema/BAD_INPUT-shaped kind/message fragments — a
+# FALLBACK for when structure is unavailable (a raised exception, a backend without the header). There
+# are deliberately NO "400"/"404"/"422" digit substrings here: a transient "retry after 4220ms" or a
+# 422-bearing trace id must classify RETRYABLE.
+_NONRETRYABLE_READBACK_MARKERS = (
+    "tool_runtime_bad_input",   # Arcade's BAD_INPUT kind (kind=TOOL_RUNTIME_BAD_INPUT_VALUE)
+    "toolinputerror",           # the wrapped tool's own input-validation exception
+    "bad_input", "bad input", "invalid input",                       # BAD_INPUT phrasings
+    "should be a valid", "input should be", "validation error", "unprocessable",  # Pydantic/schema-shaped
+)
+
+
+def _nonretryable_readback(err: str | None) -> bool:
+    """True iff a read-back error is NON-retryable by STRUCTURE — the read-back tool itself is broken (its
+    input contract drifted / the call is malformed), so retrying can only fail identically and the effect
+    must be recorded as ``verification_broken`` rather than a transient miss.
+
+    Two signals, both structural, never a bare status digit: the ``nonretryable=true`` header (emitted
+    only when Arcade's ``can_retry`` is explicitly False), or a schema/BAD_INPUT-shaped kind/message
+    (TOOL_RUNTIME_BAD_INPUT / ToolInputError / Pydantic 'should be a valid …'). A transient
+    'retry after 4220ms' or a 422-bearing trace id has neither -> RETRYABLE."""
+    low = (err or "").lower()
+    if "nonretryable=true" in low:
+        return True
+    return any(m in low for m in _NONRETRYABLE_READBACK_MARKERS)
+
+
+def _friendly_ask(toolkit: str, action: str, params: dict, *, never: bool) -> str:
+    """A short, conversational approval line — how a friend would ask to do a thing over text, not a
+    machine authorization stub. No toolkit slugs, no JSON fingerprint, no tier tags. ``never`` softly
+    flags an irreversible action so the owner knows it can't be taken back."""
+    p = params or {}
+    a = (action or "").upper()
+    tk = (toolkit or "").lower()
+    recip = p.get("to") or p.get("recipient") or p.get("recipient_email") or p.get("email")
+    ask = None
+    if tk == "gmail":
+        if "SEND" in a:
+            ask = f"want me to send this email to {recip}?" if recip else "want me to send this email?"
+        elif "TRASH" in a:
+            ask = "want me to move that email to the trash?"
+        elif "LABEL" in a:
+            ask = "want me to label that email?"
+    elif tk in ("googlecalendar", "calendar"):
+        title = p.get("summary") or p.get("title")
+        if "CREATE" in a or "ADD" in a:
+            ask = f"want me to put '{title}' on your calendar?" if title else "want me to add that to your calendar?"
+        elif "DELETE" in a or "REMOVE" in a:
+            ask = "want me to delete that calendar event?"
+    elif tk == "browser":
+        ask = "want me to go ahead and submit that on the site?"
+    if ask is None:                      # generic fallback: humanize the action verb, drop the slug
+        verb = a.replace("_", " ").strip().lower() or "do that"
+        ask = f"want me to go ahead and {verb}?"
+    if never:
+        ask += " (heads up — this one can't be undone)"
+    return ask
+
+
 class Broker:
     def __init__(
         self,
@@ -125,6 +192,8 @@ class Broker:
         overrides: dict | None = None,
         mandate: dict | None = None,
         mandate_counts: dict | None = None,
+        mandate_auto: bool = False,
+        send_preview: str = "always",
         trust: dict | None = None,
         trust_threshold: int = mandate_lib.LEARNED_TRUST_THRESHOLD,
         on_usage: Callable[..., None] | None = None,
@@ -147,6 +216,13 @@ class Broker:
         # back to RunState after the step. Default-empty -> _mandate_covers always False -> ask-everything.
         self.mandate = mandate or {}
         self.mandate_counts = mandate_lib.new_counts(mandate_counts)
+        # Draft preview (P0.3b): when the mandate was AUTO-COMMITTED (owner never saw an autonomy card)
+        # and ``send_preview != "never"`` (the fail-safe default), a delivering send is surfaced ONCE as
+        # the literal draft the owner confirms — the single touch — instead of forwarding silently. A
+        # card-approved mandate (owner already saw the plan) sends silently; ``send_preview == "never"``
+        # sends silently too.
+        self.mandate_auto = bool(mandate_auto)
+        self.send_preview = send_preview or "always"
         # Cross-run LEARNED trust: per-user clean-approval counts per action class. Auto-covers ONLY
         # reversible non-delivering classes past the threshold (see mandate.learned_covers) — never a
         # send/recipient action, so it can't widen the injection surface.
@@ -244,6 +320,69 @@ class Broker:
         except Exception:
             return None
 
+    def _readback_probe(self, *, toolkit: str, action: str, params: dict, user_id: str) -> tuple:
+        """Take an INDEPENDENT read-back AND surface a non-recoverable read-back error, if any, as
+        ``(surface, error)``. Prefers the integration's optional ``snapshot_probe`` (which no longer
+        swallows the read-back tool's own error to a bare None); falls back to plain ``snapshot`` (error
+        None) for a backend that predates the probe. Never raises — a crash degrades to ``(None, <exc>)``
+        so it is treated as a read-back failure, not a lost effect record."""
+        probe = getattr(self.integrations, "snapshot_probe", None)
+        if callable(probe):
+            try:
+                res = probe(toolkit=toolkit, action=action, params=params, user_id=user_id)
+            except Exception as exc:  # noqa: BLE001
+                return None, f"{type(exc).__name__}: {exc}"
+            if isinstance(res, tuple) and len(res) == 2:
+                return res[0], res[1]
+            return res, None      # a probe that returned a bare surface (tolerant of shape)
+        return self._safe_snapshot(lambda: self.integrations.snapshot(
+            toolkit=toolkit, action=action, params=params, user_id=user_id)), None
+
+    def _verify_readback(self, before, take_after, fp, *, before_err: str | None = None) -> tuple:
+        """Poll an INDEPENDENT read-back until the expected effect appears, tolerating provider lag, and
+        return ``(drift_present, expected_present, readback_error)`` for the EffectRecord.
+
+        ``take_after`` returns ``(after_surface, error)``. A missing baseline (``before is None``) is
+        unrecoverable -> unverifiable. Otherwise we take up to ``verify_attempts`` post-effect snapshots,
+        sleeping ``verify_delay`` between them:
+          * a valid snapshot with the expected fingerprint present -> verified (stop early);
+          * a valid snapshot WITHOUT it -> not yet, retry (Gmail's Sent label indexes with a few seconds'
+            lag), settling on ``False`` (proven-missing) only if it never appears;
+          * a ``None`` snapshot with NO error (the read-back hiccupped, or there is no read-back surface)
+            -> a TRANSIENT miss, retried rather than concluded terminal, so a one-off backend blip no
+            longer falsely escalates a send that really went out. It settles on ``None`` (unverifiable)
+            only if EVERY attempt is None.
+          * a ``None`` snapshot with a NON-RETRYABLE error (a schema/BAD_INPUT 400 — the read-back TOOL
+            is broken) -> ``verification_broken``: return the error as the THIRD element (``drift`` /
+            ``expected`` stay None). This is DISTINCT from a legitimately-absent read-back surface, and
+            it stops early because retrying the same malformed call can only fail identically. The
+            operator re-checks it on a timer instead of handing the owner a confirm-this chore.
+        More attempts only make verification MORE thorough — never more permissive (still needs the
+        precise expected fingerprint to verify)."""
+        if before is None:
+            # No baseline. If the BASELINE read-back itself errored non-retryably, the read-back tool is
+            # broken -> verification_broken; a plain missing baseline stays unverifiable (unchanged).
+            if before_err is not None and _nonretryable_readback(before_err):
+                return None, None, before_err
+            return None, None, None
+        drift, expected = None, None
+        attempts = max(1, self.verify_attempts)
+        for i in range(attempts):
+            after, err = take_after()
+            if after is None:
+                if err is not None and _nonretryable_readback(err):
+                    return None, None, err        # broken read-back tool -> verification_broken (stop)
+                drift, expected = None, None       # transient miss / no surface -> retry, don't conclude
+            else:
+                diff = effects.snapshot_diff(before, after)
+                drift = effects.has_effect(diff)
+                expected = effects.has_expected_effect(before, after, fp)
+                if expected is True or (fp is None and drift):
+                    break
+            if i < attempts - 1 and self.verify_delay > 0:
+                time.sleep(self.verify_delay)
+        return drift, expected, None
+
     def _refuse(self, *, toolkit: str, action: str,
                 reason: str = "money/payment is not a capability of this agent") -> BrokerResult:
         """A categorical HARD-REFUSAL (money/payment): no approval, no grant, no pending, no execute — and
@@ -290,8 +429,8 @@ class Broker:
         eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=True, phase="deferred",
                            effect_kind="cua" if browser else "composio", actor=self.actor, label=label)
         tgt = params.get("to") or params.get("target") or params.get("url") or ""
-        prompt = (f"About to {label}" + (f" → {tgt}" if tgt else "")
-                  + f". I'll go ahead in {undo}s unless you reply STOP.")
+        dest = f" to {tgt}" if tgt else ""
+        prompt = f"heads up — sending this{dest} in {undo}s. reply STOP to hold off."
         apr = ApprovalRequest(run_id=self.run_id, kind="undo", prompt=prompt, options=["stop"],
                               tier=tier, effect_label=label)
         pending = ({"browser": True, "action": action, "params": params} if browser
@@ -299,6 +438,32 @@ class Broker:
         return BrokerResult(status="needs_approval", ok=False, effect=eff, approval=apr,
                             grant_key=self.grant_key_for(toolkit, action, params),
                             auto_release_seconds=undo, pending=pending)
+
+    def _preview_send(self, *, toolkit: str, action: str, params: dict, tier: str) -> BrokerResult:
+        """Park a delivering send under an auto-committed mandate as a ONE-TIME draft preview (P0.3b): the
+        approval's ``prompt`` IS the outgoing draft (recipient + subject/body), and its ``kind='preview'``
+        tells the operator to apply the preview reply-semantics (yes -> send; no -> stop; anything else ->
+        revise + re-preview). Rides the EXISTING needs_approval + resume-at-action machinery — the send
+        never weakens verification: on 'yes' the issued grant authorizes the EXACT action, the resumed send
+        skips the preview branch (already_authed) and forwards + reads back like any other gated send."""
+        label = f"{toolkit}:{action}"
+        browser = toolkit == "browser"
+        recips = mandate_lib.extract_recipients(toolkit, action, params)
+        to = ", ".join(recips) if recips else str(params.get("to") or params.get("recipient") or "them")
+        subject = str(params.get("subject") or "").strip()
+        body = str(params.get("body") or params.get("text") or params.get("message") or "").strip()
+        draft = f"Subject: {subject}\n\n{body}" if (subject and body) else (body or subject or "(an empty message)")
+        if len(draft) > 1200:
+            draft = draft[:1200] + "…"
+        prompt = f"Here's what I'll send to {to}:\n\n{draft}\n\n— send it?"
+        eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=True, phase="deferred",
+                           effect_kind="cua" if browser else "composio", actor=self.actor, label=label)
+        apr = ApprovalRequest(run_id=self.run_id, kind="preview", prompt=prompt, options=["yes", "no"],
+                              tier=tier, effect_label=label)
+        pending = ({"browser": True, "action": action, "params": params} if browser
+                   else {"toolkit": toolkit, "action": action, "params": params})
+        return BrokerResult(status="needs_approval", ok=False, effect=eff, approval=apr,
+                            grant_key=self.grant_key_for(toolkit, action, params), pending=pending)
 
     def call_integration(self, *, toolkit: str, action: str, params: dict, user_id: str,
                          authorized: bool = False, grants: set | None = None) -> BrokerResult:
@@ -312,6 +477,7 @@ class Broker:
         # WHETHER to verify a world effect comes from the NATURAL tier (not overridable): an owner's
         # auto override may waive the APPROVAL prompt, but never the independent read-back verification.
         side = policy.is_side_effecting(toolkit, action)
+        mut = policy.is_mutating(toolkit, action)   # False for a non-mutating fetch (clone/find/analyze)
         must_approve = tier in (policy.ASK, policy.NEVER)
         label = f"{toolkit}:{action}"
         gk = self.grant_key_for(toolkit, action, params)
@@ -325,6 +491,16 @@ class Broker:
         # verified. _mandate_covers re-asserts tier==ASK and not is_refused, so money/NEVER are unreachable.
         already_authed = bool(authorized) or (gk in (grants or set()))
         mandate_covered = side and self._mandate_covers(toolkit, action, params, tier)
+        # Draft preview (P0.3b): a delivering send about to go out under an AUTO-COMMITTED mandate is
+        # surfaced ONCE as the literal draft the owner confirms — the single touch — before it forwards.
+        # Only a genuine delivering send (is_recipient_bearing), only when preview isn't disabled, and only
+        # the FIRST time: the owner's 'yes' grants the exact gk, so the resumed send is already_authed, skips
+        # this branch, and forwards + verifies normally. The preview never touches ``side``/the read-back — it
+        # only shows the draft before the SAME gated send runs.
+        if (mandate_covered and self.mandate_auto and not already_authed
+                and self.send_preview != "never"      # fail-safe: preview unless EXPLICITLY disabled
+                and mandate_lib.is_recipient_bearing(toolkit, action)):
+            return self._preview_send(toolkit=toolkit, action=action, params=params, tier=tier)
         # Undo-window: a mandate-covered send (not yet owner-authorized) with undo_seconds>0 becomes a timed
         # SOFT-CONFIRM — parks with an auto-release timer the owner can veto, instead of forwarding now.
         undo = mandate_lib.undo_seconds((self.mandate or {}).get("undo_seconds"))   # coerce/clamp fail-closed
@@ -344,31 +520,29 @@ class Broker:
             eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=True,
                                phase="deferred", actor=self.actor, label=label)
             kind = "never" if tier == policy.NEVER else "side_effect"
-            fp = self.integrations.fingerprint(toolkit=toolkit, action=action, params=params)
-            detail = f" -> {json.dumps(fp)}" if fp else ""
-            prompt = (f"Authorize {label}{detail}? ({tier}-tier"
-                      + (" — irreversible/money" if tier == policy.NEVER else "") + ")")
+            prompt = _friendly_ask(toolkit, action, params, never=(tier == policy.NEVER))
             # Draft-then-send preview: surface the LITERAL body of an outbound message so the owner sees
             # exactly what goes out under their name before approving (the trust answer to impersonation).
             # The grant binds the full params (byte-identical body), so this is pure UI surfacing.
             body = str(params.get("body") or params.get("text") or params.get("message") or "").strip()
             if body:
                 preview = body if len(body) <= 600 else body[:600] + "…"
-                prompt = f"About to send (under your name):\n\n{preview}\n\n{prompt}"
+                prompt = f"{prompt}\n\n\"{preview}\""
             apr = ApprovalRequest(run_id=self.run_id, kind=kind, prompt=prompt,
                                   options=["yes", "no"], tier=tier, effect_label=label)
             return BrokerResult(status="needs_approval", ok=False, effect=eff, approval=apr,
                                 grant_key=gk,
                                 pending={"toolkit": toolkit, "action": action, "params": params})
 
-        before = self._safe_snapshot(lambda: self.integrations.snapshot(
-            toolkit=toolkit, action=action, params=params, user_id=user_id)) if side else None
+        before, before_err = (self._readback_probe(toolkit=toolkit, action=action, params=params,
+                                                    user_id=user_id) if side else (None, None))
         try:
             ex = self.integrations.execute(toolkit=toolkit, action=action, params=params, user_id=user_id)
         except Exception as exc:  # a backend failure is a result, not a crash
-            eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=side,
+            eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=side, mutating=mut,
                                phase="failed", actor=self.actor, label=label)
             eff.detail["grant_key"] = gk   # identity: a verified retry of THIS action can supersede it
+            eff.detail["error"] = f"{type(exc).__name__}: {exc}"   # loud: keep the failure in the ledger
             return BrokerResult(status="error", ok=False, effect=eff, error=f"{type(exc).__name__}: {exc}")
 
         if not ex.ok:
@@ -387,9 +561,10 @@ class Broker:
                     return BrokerResult(status="needs_auth", ok=False, effect=eff, auth_url=url,
                                         pending={"toolkit": toolkit, "action": action, "params": params},
                                         error=ex.error)
-            eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=side,
+            eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=side, mutating=mut,
                                phase="failed", actor=self.actor, label=label)
             eff.detail["grant_key"] = gk   # identity: a verified retry of THIS action can supersede it
+            eff.detail["error"] = ex.error   # loud: keep the backend failure in the ledger, not just None
             return BrokerResult(status="error", ok=False, effect=eff, error=ex.error)
 
         if not side:
@@ -408,24 +583,22 @@ class Broker:
         created = _ck(toolkit=toolkit, action=action, data=ex.data) if callable(_ck) else None
         if created is not None:
             fp = {**(fp or {}), "id": str(created) if created else "\x00:flowers-no-created-id"}
-        drift, expected = None, None
-        for i in range(max(1, self.verify_attempts)):
-            after = self._safe_snapshot(lambda: self.integrations.snapshot(
-                toolkit=toolkit, action=action, params=params, user_id=user_id))
-            if before is None or after is None:
-                drift, expected = None, None        # no reliable read-back -> unverifiable (ask owner)
-                break
-            diff = effects.snapshot_diff(before, after)
-            drift = effects.has_effect(diff)
-            expected = effects.has_expected_effect(before, after, fp)
-            if expected is True or (fp is None and drift):
-                break
-            if i < self.verify_attempts - 1 and self.verify_delay > 0:
-                time.sleep(self.verify_delay)
+        drift, expected, readback_error = self._verify_readback(
+            before,
+            lambda: self._readback_probe(toolkit=toolkit, action=action, params=params, user_id=user_id),
+            fp, before_err=before_err)
         eff = EffectRecord(toolkit=toolkit, action=action, side_effecting=True, phase="forwarded",
                            drift_present=drift, expected_present=expected, effect_kind="composio",
                            actor=self.actor, label=label)
         eff.detail["grant_key"] = gk   # bind the effect to its grant so the run can dedup an exact re-send
+        if readback_error and expected is None and drift is None:
+            # verification_broken: the send FORWARDED but our own read-back tool errored non-retryably
+            # (schema drift / BAD_INPUT) — the send is fine, the CHECK is broken. Record it loudly and
+            # distinctly (NOT plain unverifiable): the operator treats it as landed for step completion
+            # (landed_effects semantics), re-checks it on a timer, and never hands the owner a confirm
+            # chore. verified_effects stays strict, so the final report never CLAIMS it verified.
+            eff.detail["readback_error"] = readback_error
+            eff.detail["readback_params"] = dict(params)   # the operator's +60s re-check re-runs the probe
         if mandate_covered:   # count the forwarded send against the caps + stamp the audit trail
             mandate_lib.bump(self.mandate_counts, toolkit=toolkit, action=action, params=params)
             eff.detail["authorized_by"] = "mandate"
@@ -490,6 +663,12 @@ class Broker:
             return self._already_done(toolkit="browser", action=action, gk=gk, label=label, browser=True)
         already_authed = bool(authorized) or (gk in (grants or set()))
         mandate_covered = side and self._mandate_covers("browser", action, params, tier)
+        # Draft preview (P0.3b): there is deliberately NO preview branch here. mandate_lib.owner_grant only
+        # ever mints an AUTO-committed mandate for gmail/slack SEND classes (never a browser scope), so a
+        # browser send can't ride ``mandate_auto`` today — the preview would have nothing to fire on. If
+        # owner_grant is ever extended beyond email scopes, a browser delivering send would need the SAME
+        # one-time draft-preview treatment call_integration gives it (surface the draft once, then let the
+        # owner's 'yes' authorize the exact gk so the resumed action forwards + verifies normally).
         undo = mandate_lib.undo_seconds((self.mandate or {}).get("undo_seconds"))   # coerce/clamp fail-closed
         if mandate_covered and undo > 0 and not already_authed:
             return self._queue_undo(toolkit="browser", action=action, params=params, tier=tier, undo=undo)
@@ -499,18 +678,13 @@ class Broker:
             eff = EffectRecord(toolkit="browser", action=action, side_effecting=True, phase="deferred",
                                effect_kind="cua", actor=self.actor, label=label)
             kind = "never" if tier == policy.NEVER else "side_effect"
-            tgt = params.get("target") or params.get("url") or ""
-            detail = f" -> {json.dumps(fp)}" if fp else (f" -> {tgt}" if tgt else "")
+            # observe-then-act: the model's plain-English description of the resolved action (from an
+            # `inspect` it just did) leads, so the owner approves the EXACT thing, not a selector.
+            desc = str(params.get("describe") or "").strip()
+            prompt = desc if desc else _friendly_ask("browser", action, params, never=(tier == policy.NEVER))
             obs = params.get("observe_url")
             if obs:   # surface the VERIFICATION channel so the owner consents to it, not just the action
-                detail += f" [verify via {params.get('observe_via') or 'http'}: {obs}]"
-            prompt = (f"Authorize {label}{detail}? ({tier}-tier"
-                      + (" — irreversible/money" if tier == policy.NEVER else "") + ")")
-            # observe-then-act: the model's plain-English description of the resolved action (from an
-            # `inspect` it just did) leads the prompt, so the owner approves the EXACT thing, not a selector.
-            desc = str(params.get("describe") or "").strip()
-            if desc:
-                prompt = f"{desc}\n\n{prompt}"
+                prompt += f"\n\n(I'll confirm it via {params.get('observe_via') or 'the page'}: {obs})"
             apr = ApprovalRequest(run_id=self.run_id, kind=kind, prompt=prompt,
                                   options=["yes", "no"], tier=tier, effect_label=label)
             return BrokerResult(status="needs_approval", ok=False, effect=eff, approval=apr,
@@ -544,21 +718,14 @@ class Broker:
             return BrokerResult(status="ok", ok=True, data=data, effect=eff)
 
         # Independent read-back (retry for eventual consistency), matched against the expected fingerprint.
+        # The browser observer has no distinct read-back-error channel, so the probe returns (after, None)
+        # -> verification_broken never applies to a CUA effect (it is provenance-gated instead).
         observer = self.browser.observer_id(user_id)
-        drift, expected = None, None
-        for i in range(max(1, self.verify_attempts)):
-            after = self._safe_snapshot(
-                lambda: self.browser.observe(action=action, params=params, user_id=user_id))
-            if before is None or after is None:
-                drift, expected = None, None          # no independent observation -> unverifiable (ask owner)
-                break
-            diff = effects.snapshot_diff(before, after)
-            drift = effects.has_effect(diff)
-            expected = effects.has_expected_effect(before, after, fp)
-            if expected is True or (fp is None and drift):
-                break
-            if i < self.verify_attempts - 1 and self.verify_delay > 0:
-                time.sleep(self.verify_delay)
+        drift, expected, _readback_error = self._verify_readback(
+            before,
+            lambda: (self._safe_snapshot(
+                lambda: self.browser.observe(action=action, params=params, user_id=user_id)), None),
+            fp)
         eff = EffectRecord(toolkit="browser", action=action, side_effecting=True, phase="forwarded",
                            drift_present=drift, expected_present=expected, effect_kind="cua",
                            actor=res.actor, observer=observer, label=label)

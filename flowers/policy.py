@@ -27,7 +27,7 @@ _TIERS = (AUTO, ASK, NEVER)   # valid tiers (REFUSE is a verdict, NOT a tier —
 
 _READ_VERBS = frozenset({
     "get", "list", "fetch", "read", "search", "find", "retrieve", "view", "describe",
-    "count", "check", "lookup", "query", "status", "info", "show",
+    "count", "check", "lookup", "query", "status", "info", "show", "analyze", "inspect",
 })
 # Bulk data-egress verbs are NOT auto-safe: an export/download/sync can read out a whole
 # mailbox/repo the model then exfiltrates. Side-effecting (ask + read-back), even though they "read."
@@ -257,3 +257,18 @@ def is_side_effecting(toolkit: str, action: str, *, overrides: dict | None = Non
     """True iff the action is NOT auto-tier (it mutates external state — the trigger for before/after
     read-back snapshots and effect verification)."""
     return classify(toolkit, action, overrides=overrides) != AUTO
+
+
+# Actions that are gated/verified but do NOT mutate EXTERNAL state — a credentialed FETCH into a private
+# sandbox. A FAILED such attempt leaves no external footprint, so it must not poison a run the way a
+# failed send/create/delete does. Everything not listed is mutating. (None wired in this distribution.)
+_NONMUTATING_ACTIONS: frozenset[tuple[str, str]] = frozenset()
+
+
+def is_mutating(toolkit: str, action: str) -> bool:
+    """True iff a FAILED attempt of this action could have left an external effect (so the gate must
+    account for it). False only for non-mutating fetches/reads — a read-only action (auto-tier) or an
+    explicit sandbox-fetch (clone/find/analyze). Default True: fail toward strict."""
+    if (str(toolkit).lower(), str(action).upper()) in _NONMUTATING_ACTIONS:
+        return False
+    return is_side_effecting(toolkit, action)

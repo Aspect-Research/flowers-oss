@@ -13,6 +13,7 @@ not re-run.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import tempfile
@@ -36,6 +37,8 @@ from flowers.seams.telemetry import NoOpTracer
 from flowers.types import (
     ApprovalRequest,
     Goal,
+    Plan,
+    PlanStep,
     RunState,
     RunStatus,
     StepKind,
@@ -68,6 +71,9 @@ _MIN_INTERVAL_S = 60.0     # floor on a monitor interval so a tiny/negative valu
 _CONNECT_POLL_S = 15.0     # how often a parked-on-connect run polls for the OAuth grant to land
 _AWAIT_CHECK_S = 180.0     # default interim reply-check cadence while an await window is open
 _MAX_CONNECT_POLLS = 240   # backstop on connect polls (~1h @ 15s); the run's deadline_ts also bounds it
+_REVERIFY_DELAY_S = 60.0   # a verification_broken send's ONE durable re-check fires +60s later (P0.1c):
+#                            re-run the read-back once the broken tool may have recovered, then notify
+#                            the owner ONLY if it proves the send actually missing.
 
 _PROVIDER_LABELS = {"gmail": "Gmail", "googlecalendar": "Google Calendar"}
 
@@ -108,6 +114,150 @@ class _GateOutcome:
     accept: bool
     reason: str
     needs_owner: bool   # the gate routed an effect to the owner (unverifiable) -> escalate, don't redirect
+    owner_prompt: str = ""   # a friendly owner-facing message for the needs_owner case (no slug/machine phrasing)
+
+
+def _friendly_effect_clause(label: str) -> str:
+    """A plain-English past-tense clause for a toolkit:ACTION effect label — reads after 'I ':
+    'sent the email', 'pushed the code'. For owner-facing messages (never the raw slug)."""
+    tk, _, act = (label or "").partition(":")
+    a = act.upper()
+    tk = tk.lower()
+    if tk == "gmail" and "SEND" in a:
+        return "sent the email"
+    if tk in ("googlecalendar", "calendar") and ("CREATE" in a or "ADD" in a):
+        return "added the calendar event"
+    if tk == "browser":
+        return "submitted that on the site"
+    return f"ran {act.replace('_', ' ').strip().lower() or 'that'}"
+
+
+def _unverifiable_owner_msg(unverifiable: list[str]) -> str:
+    """The needs-your-confirmation escalation, worded as a light, honest question rather than a chore
+    (P1.4): 'I sent the email, but couldn't confirm on my end that it actually went through — did it
+    arrive?' No slug, no 'read-back' jargon, no 'double-check' errand. The 'did it arrive?' shape lines up
+    with the P0.2 reply vocabulary: 'it arrived'/'yes' confirm, and a bare 'no'/'nothing arrived' denies
+    (the denied->resend path — a bare 'no' answers THIS question as "it didn't", so on needs_owner_confirm
+    it maps to denied, not stop; see ``_deterministic_intent``). Deliberately offers NO 'retry' — the action
+    already FORWARDED (landed_effects), so a retry after a landed send risks a DOUBLE-send; the owner's own
+    confirmation is the evidence we're missing here."""
+    clauses: list[str] = []
+    for lbl in unverifiable:
+        c = _friendly_effect_clause(lbl)
+        if c not in clauses:
+            clauses.append(c)
+    if not clauses:
+        did, it = "did that", "it"
+    elif len(clauses) == 1:
+        did, it = clauses[0], "it"
+    else:
+        did = ", ".join(clauses[:-1]) + f" and {clauses[-1]}"
+        it = "they"
+    return (f"I {did}, but couldn't confirm on my end that {it} actually went through — "
+            f"did {it} arrive?")
+
+
+def _is_verification_broken(eff) -> bool:
+    """True iff an effect is the ``verification_broken`` state the broker records: a FORWARDED
+    side-effect whose own read-back tool errored non-retryably (``detail['readback_error']``), so it is
+    neither verified nor proven-missing — the SEND is fine, the CHECK is broken. It is NOT an owner
+    chore: the operator treats it as landed for step completion and re-checks it on a timer."""
+    return bool(getattr(eff, "side_effecting", False) and eff.phase == "forwarded"
+                and eff.expected_present is None and (eff.detail or {}).get("readback_error"))
+
+
+def _reverify_missing_msg(labels: list[str]) -> str:
+    """The honest owner notice when a +60s re-check PROVES a send that we'd reported as delivered was
+    actually not there — worded like a person owning the correction, no slug, no 'read-back' jargon.
+    Deliberately promises NO retry: the escalation handler can't safely resend (a byte-identical resend
+    is idempotency-short-circuited; retry wiring is P0.2), so it opens the question instead of a mechanism
+    it can't honour."""
+    clauses: list[str] = []
+    for lbl in labels:
+        c = _friendly_effect_clause(lbl)
+        if c not in clauses:
+            clauses.append(c)
+    did = clauses[0] if len(clauses) == 1 else (", ".join(clauses[:-1]) + f" and {clauses[-1]}"
+                                                if clauses else "did that")
+    return (f"Quick correction — I'd said I {did}, but on a second check it doesn't look like it "
+            f"actually went out. How do you want to handle it?")
+
+
+# ---- escalation-reply intents (P0.2) -------------------------------------------------------------
+# An escalation is a PARKED conversation; the owner's reply carries one of these intents. It is
+# classified DETERMINISTICALLY first (``_deterministic_intent``), and only a reply no shortcut fits
+# costs ONE cheap model call (``Operator._classify_escalation_reply``) that HARD-DEFAULTS to
+# "guidance" — the safe, replan-only intent that can never authorize anything — on any error/invalid
+# output. ``confirmed``/``denied`` only carry send-attestation meaning on the two send-confirmation
+# escalations (needs_owner_confirm / reverify_proven_missing); on any other escalation they fall
+# through to guidance, preserving the pre-P0.2 replan behavior.
+_INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {"intent": {"type": "string",
+                              "enum": ["confirmed", "denied", "retry", "stop", "guidance"]}},
+    "required": ["intent"],
+}
+_INTENT_SYSTEM = """You classify ONE reply an owner texted back to a personal assistant that had paused a
+task and asked the owner a question. The assistant either (a) sent/did something it could NOT confirm on
+its own and asked the owner to double-check it actually went through, or (b) is asking how to proceed.
+Pick the single best label for the owner's reply:
+
+- "confirmed": the owner says it DID go through / arrived / worked ("it was sent", "got it", "yep, arrived").
+- "denied": the owner says it did NOT arrive / never showed up ("nothing arrived", "didn't get it").
+- "retry": the owner wants it attempted again / re-sent.
+- "stop": the owner wants to drop it / leave it / never mind.
+- "guidance": anything else — new instructions, a redirect, or an ambiguous reply.
+
+Return {"intent": ...}."""
+
+# Model-free shortcuts for the common replies (matched case-insensitively on the trimmed reply, trailing
+# '.'/'!' stripped). Explicit confirm/deny/retry tokens are checked BEFORE the bare-decline stop rule so
+# "no email here" reads as denied, not stop. A BARE "yes" is confirmation only on the "did it go through?"
+# question (needs_owner_confirm); the reverify "how do you want to handle it?" makes a bare yes genuinely
+# ambiguous, so it falls to the model / guidance default. Symmetrically, a BARE "no" is a DENIAL ("it
+# didn't arrive") only on that same needs_owner_confirm question; on any other escalation (the open-ended
+# reverify question, or a non-send failure) a bare "no" keeps its pre-P0.2 meaning: stop.
+_STOP_WORDS = frozenset({"stop", "leave it", "nevermind", "never mind", "drop it", "forget it"})
+_RETRY_WORDS = frozenset({"retry", "try again", "resend", "re-send", "send it again", "send again"})
+_CONFIRM_WORDS = frozenset({"it was sent", "sent", "it sent", "got it", "it worked", "worked", "all good",
+                            "yes it went through", "it went through", "went through", "received",
+                            "it arrived", "✓", "✔", "👍"})
+_DENY_WORDS = frozenset({"nothing arrived", "didn't get it", "didnt get it", "no email here",
+                         "never arrived", "didn't arrive", "didnt arrive", "nothing here",
+                         "never got it", "didn't come through", "didnt come through"})
+_YES_WORDS = frozenset({"yes", "yep", "yeah", "yup", "ya"})
+# The bare "no"-family (mirrors channels.base._NO_FAMILY). Meaning is question-dependent — see the
+# needs_owner_confirm branch in ``_deterministic_intent``.
+_NO_WORDS = frozenset({"no", "nope", "nah", "n"})
+
+
+def _deterministic_intent(ans: str, reason_code: str) -> str | None:
+    """A model-free intent for the common escalation replies, or None to fall to the cheap model call."""
+    t = (ans or "").strip().lower().rstrip(".!")
+    if not t:
+        return None
+    if t in _RETRY_WORDS:
+        return "retry"
+    if t in _CONFIRM_WORDS:
+        return "confirmed"
+    if t in _DENY_WORDS:
+        return "denied"
+    # On the "did it arrive?" send-confirmation escalation (needs_owner_confirm), a BARE "no"-family reply
+    # is the owner ANSWERING that question — it did NOT arrive — which is DENIED (the P0.2 denied->resend
+    # path), NOT a request to stop. Checked BEFORE the bare-decline stop rule so this "no" routes to the
+    # resend, not a stop. On EVERY other escalation (the reverify "how do you want to handle it?" open
+    # question, or a non-send failure) a bare "no" falls through and keeps its pre-P0.2 meaning: stop.
+    # Explicit stop tokens ("stop"/"leave it"/...) always stop, even here (they are not in _NO_WORDS).
+    if reason_code == "needs_owner_confirm" and t in _NO_WORDS:
+        return "denied"
+    # A BARE decline stops the run (the pre-P0.2 heuristic, preserved verbatim: 'no'/'stop'/'cancel' etc.
+    # or any short <=3-word decline-prefixed reply). A longer decline-prefixed sentence is GUIDANCE, not a
+    # stop (a redirect that merely starts with "No" must steer the run, not kill it).
+    if t in _STOP_WORDS or (parse_answer(ans)["decision"] == "no" and len(ans.split()) <= 3):
+        return "stop"
+    if t in _YES_WORDS:
+        return "confirmed" if reason_code == "needs_owner_confirm" else None
+    return None
 
 
 class Operator:
@@ -116,7 +266,9 @@ class Operator:
                  budget: SemanticBudget | None = None,
                  clarify_enabled: bool = True, announce_enabled: bool = True,
                  mandate_enabled: bool = True, verifier_enabled: bool = True,
-                 verify_attempts: int = 1, verify_delay: float = 0.0):
+                 verify_attempts: int = 1, verify_delay: float = 0.0,
+                 send_preview: str = "always", escalation_ttl_h: float = 24.0,
+                 fast_path_enabled: bool = True):
         self.store = store
         self.model = model
         self.search = search
@@ -136,6 +288,22 @@ class Operator:
         # single editable card (AWAITING_GO) and, once approved, widens authorization for in-scope
         # reversible actions. Default-empty (no proposed mandate, or declined) -> today's ask-everything.
         self.mandate_enabled = mandate_enabled
+        # Single-action fast path (P1.3): when on (default), a self-contained 'email <one named address>
+        # saying <content>' skips the clarifier + planner LLM calls for a deterministic compose->send
+        # template plan (~5 -> <=2 model calls). Plumbed from FLOWERS_FAST_PATH in app.py. Requires
+        # mandate_enabled (the send auto-commits via owner_grant); any goal the detector doesn't match
+        # runs the UNCHANGED full pipeline.
+        self.fast_path_enabled = fast_path_enabled
+        # Draft preview (P0.3b): "always" (default) surfaces an auto-committed delivering send as a draft
+        # the owner confirms (the single touch); "never" sends it directly (zero touches). Plumbed from
+        # FLOWERS_SEND_PREVIEW in app.py, like the other FLOWERS_* knobs. Only affects OWNER-GRANT
+        # (auto-committed) mandates — a card-approved mandate always sends silently (owner saw the plan).
+        self.send_preview = send_preview or "always"
+        # Zombie-run reaper TTL (P1.1): how long an ESCALATED run may sit unanswered before it is closed
+        # quietly. Plumbed from FLOWERS_ESCALATION_TTL_H in app.py; junk/non-positive falls back to 24h
+        # (never a zero/negative TTL that would reap the instant a run escalates).
+        _ttl = _num(escalation_ttl_h, 24.0)
+        self.escalation_ttl_h = _ttl if _ttl > 0 else 24.0
         self.verify_attempts = verify_attempts   # read-back retries (live: tolerate provider lag)
         self.verify_delay = verify_delay
         self._sandbox_factory = sandbox_factory or _default_sandbox
@@ -146,6 +314,8 @@ class Operator:
         self._connect: dict = {}         # run_id -> {toolkit,url,polls} for a parked-on-connect run
         self._fetched: dict = {}         # run_id -> set of URLs actually fetched (source_membership check)
         self._discovered: dict = {}      # run_id -> set of recipients admitted to scope by fetch-provenance
+        self._guidance_pleaded: set = set()  # run_ids that already got the "rephrase?" plea once — never
+        #                                twice in a row (P0.2): a second unparseable guidance closes DONE.
         # Per-run drive mutex: the served app can enter a run from TWO threads at once — the tick
         # poller (a due timer -> resume) and a request worker (an owner answer -> resume, or a fresh
         # drive). Without exclusion they double-drive the same run: two concurrent step loops, a
@@ -235,6 +405,18 @@ class Operator:
             self._escalate(run, "refused: I can't help with this — it asks for something illegal, "
                                 "which flowers will not do.")
             return run
+        # Single-action fast path (P1.3): a self-contained "email <one named address> saying <content>"
+        # skips the clarifier AND planner LLM calls — a deterministic template plan + the owner-grant
+        # auto-mandate drive straight to the executor's compose, and the draft preview IS the plan
+        # announcement (§4.3). The detector is fail-closed (multiple recipients / no content / a second
+        # task / any pre-existing constraint -> None), so ANY doubt falls through to the unchanged
+        # pipeline below. Runs AFTER the disallowed pre-screen (the refuse floor holds, fast or slow).
+        if self.fast_path_enabled and self.mandate_enabled:
+            fs = mandate_lib.fast_path_goal(goal)
+            if fs is not None:
+                settled = self._fast_plan_and_drive(run, goal, fs)
+                if settled is not None:
+                    return settled
         questions = self.clarifier.clarify(goal, broker=self._broker(run),
                                            memory=self.store.get_memory())
         if questions:
@@ -297,6 +479,7 @@ class Operator:
             if appr is None:
                 return run
             is_undo = appr.kind == "undo"   # a mandate undo-window soft-confirm (auto-releases on its timer)
+            is_preview = appr.kind == "preview"   # a P0.3b draft preview — distinct reply-semantics below
             stored = self._answer_for(run)
             if is_undo and event == "timer" and answer is None and stored is None:
                 decision = "yes"            # the undo window elapsed with no veto -> release the send
@@ -304,6 +487,12 @@ class Operator:
                 decision = parse_answer((answer if answer is not None else stored) or "")["decision"]
             if is_undo:
                 self.timers.cancel_for_run(run.run_id)   # the window is resolved either way
+            # Draft-preview reply-semantics (P0.3b): yes -> send (falls through to the grant+resume path);
+            # a bare no -> stop the run cleanly; ANY OTHER reply -> treat as edit guidance (revise the draft
+            # and re-preview). Only "yes" authorizes the exact previewed draft; edits never send the old one.
+            if is_preview and decision != "yes":
+                raw = (answer if answer is not None else stored) or ""
+                return self._stop_preview(run) if decision == "no" else self._revise_preview(run, goal, raw)
             if decision == "yes":
                 # ONE answer parser (channels.base.parse_answer) so the owner's "yes"/"do it"/"send it"
                 # vocabulary is identical on every surface (web + SMS) and can't silently diverge.
@@ -414,6 +603,50 @@ class Operator:
         return self._drive(run, goal)
 
     # ================================================================ planning / driving
+    def _fast_plan_and_drive(self, run: RunState, goal: Goal, fs) -> RunState | None:
+        """Drive the P1.3 single-action fast path: a deterministic TEMPLATE plan (no planner LLM call) of
+        ONE compose-and-send step, with the owner-grant mandate committed EXACTLY as :meth:`_plan_and_drive`
+        would commit a planner-proposed one (same ``owner_grant`` derivation, same ``mandate_auto`` flag, so
+        the P0.3 preview + P0.2 escalation machinery downstream is byte-identical). No ``plan_announce`` —
+        the draft preview IS the announcement (§4.3): it already renders standalone (recipient + the full
+        draft), so suppressing the separate announce loses nothing. Returns None when ``owner_grant``
+        declines the template proposal (fail-closed — the caller falls through to the unchanged full
+        pipeline; the fast path never authorizes on its own say-so). Everything after this method is the
+        EXISTING machinery: the executor's normal compose+send, the broker preview park, the read-back
+        gate, and — on any wobble (a done-claim without a send, a gate refusal, a replan) — the normal
+        redirect/replan path, planner included (the <=2-call budget is the happy path only)."""
+        proposed = {
+            "action_types": [fs.action_label],
+            "recipient_scope": [fs.recipient],
+            "magnitude_caps": {"max_sends": 1, "per_domain": 1, "per_recipient": 1},
+            "irreversibility_ceiling": "ASK",
+            "done_definition": f"the email to {fs.recipient} is sent and verified",
+            "undo_seconds": 0,
+        }
+        granted = mandate_lib.owner_grant(proposed, goal)
+        if granted is None:
+            return None                       # anything off -> the unchanged full pipeline (never force it)
+        run.status = RunStatus.PLANNING
+        self.store.save_run(run)
+        # The template step mirrors a planner-authored send step field-for-field: a generic step whose
+        # ``produces`` label became the ``effect_landed`` done-criterion (planner._parse_steps emits exactly
+        # this shape), so the gate REQUIRES the send actually landed — an executor that claims done without
+        # sending is refused and the normal redirect/replan machinery takes over.
+        step = PlanStep(index=0, text=f"compose and send the email to {fs.recipient}",
+                        kind=StepKind.GENERIC,
+                        done_criteria=[{"id": "effect_landed",
+                                        "objective_check": {"kind": "effect_landed",
+                                                            "params": {"label": fs.action_label}}}])
+        plan = Plan(steps=[step], goal_text=goal.text, mandate=proposed)
+        self.store.save_plan(run.run_id, plan)   # the proposal rides the plan, like a planner-proposed one
+        run.mandate = granted
+        run.mandate_auto = True   # drives the draft-preview single touch (P0.3b), exactly as owner-grant
+        run.fast_path = True      # skips the finish-time verifier (see _handle_step_result) + marks the run
+        run.mandate_counts = mandate_lib.new_counts()
+        run.status = RunStatus.RUNNING
+        self.store.save_run(run)
+        return self._drive(run, goal)
+
     def _plan_and_drive(self, run: RunState, goal: Goal) -> RunState:
         run.status = RunStatus.PLANNING
         self.store.save_run(run)
@@ -428,6 +661,19 @@ class Operator:
         # grant it ONCE (AWAITING_GO) before driving. On approval the run.mandate is committed and in-scope
         # actions auto-authorize; declining (or no mandate) keeps today's per-action approval.
         if self.mandate_enabled and proposed:
+            # OWNER-GRANT (P0.3a): if the goal ITSELF already authorizes exactly this scope — an explicit
+            # imperative naming the send + recipients the owner named (in the goal text OR their own
+            # clarifier reply, both carried on ``goal``; a clarifier-supplied recipient counts as
+            # named-by-owner via goal_named_recipients over goal.constraints) — commit a TIGHT mandate
+            # (exactly the named recipients, one send each) and skip the card. Anything broader -> card.
+            granted = mandate_lib.owner_grant(proposed, goal)
+            if granted is not None:
+                run.mandate = granted
+                run.mandate_auto = True   # drives the draft-preview single touch (P0.3b)
+                run.mandate_counts = mandate_lib.new_counts()
+                run.status = RunStatus.RUNNING
+                self.store.save_run(run)
+                return self._drive(run, goal)
             apr = ApprovalRequest(run_id=run.run_id, kind="mandate",
                                   prompt=mandate_lib.render_card(proposed), options=["yes", "no"])
             self._park(run, RunStatus.AWAITING_GO, apr)
@@ -517,28 +763,215 @@ class Operator:
             return run
         return self._drive(run, goal)
 
+    # ---- draft-preview resume (P0.3b) ----------------------------------------------------------------
+    def _stop_preview(self, run) -> RunState:
+        """Owner declined the draft preview (a bare 'no') -> STOP the run cleanly. The send was parked
+        BEFORE the forward, so nothing went out and there is nothing to correct — a clean stop, never an
+        escalation/owner-declined dead end."""
+        self._pending_grant.pop(run.run_id, None)
+        self._resume_state.pop(run.run_id, None)
+        self._persist_continuation(run.run_id)
+        run.pending_approval = None
+        run.status = RunStatus.STOPPED
+        run.updated_at = now_ts()
+        self._release_run_resources(run)
+        self.store.save_run(run)
+        self.timers.cancel_for_run(run.run_id)
+        self._emit(run, "notify", "okay — I won't send it.")
+        return run
+
+    def _revise_preview(self, run, goal, edit: str) -> RunState:
+        """Owner replied to the draft preview with EDITS (not yes/no) -> revise + re-preview. Drop the
+        pending grant/resume for the OLD draft (never authorize it), feed the owner's changes back into the
+        RUNNING send step as feedback, and re-drive: the executor regenerates the REVISED send, which parks
+        a FRESH preview of the new draft. The revised send still flows through the broker + read-back gate,
+        and the recipient allow-list is untouched — an edit revises CONTENT, never widens scope."""
+        prior = (self._resume_state.get(run.run_id) or {}).get("pending", {}).get("params", {}) or {}
+        self._pending_grant.pop(run.run_id, None)
+        self._resume_state.pop(run.run_id, None)
+        self._persist_continuation(run.run_id)
+        plan = self.store.get_plan(run.run_id)
+        running = [s for s in plan.steps if s.status is StepStatus.RUNNING] if plan else []
+        run.pending_approval = None
+        run.status = RunStatus.RUNNING
+        run.updated_at = now_ts()
+        if not running:
+            self.store.save_run(run)
+            return self._drive(run, goal)             # lost the step -> just carry on driving
+        step = running[0]
+        prior_subject = str(prior.get("subject") or "").strip()
+        prior_body = str(prior.get("body") or prior.get("text") or prior.get("message") or "").strip()
+        draft = (f"Subject: {prior_subject}\n{prior_body}" if prior_subject else prior_body) \
+            or "(the draft you prepared)"
+        step.params["_feedback"] = (
+            "The owner reviewed the draft you were about to send and asked for CHANGES before it goes out — "
+            "do NOT send the old version.\n"
+            f"YOUR PREVIOUS DRAFT:\n{draft}\n\n"
+            f"THE OWNER'S REQUESTED CHANGES: {edit}\n"
+            "Revise the message accordingly and send the REVISED version to the same recipient.")
+        step.params.pop("_box_baseline", None)         # a fresh box baseline for the re-run
+        step.status = StepStatus.PENDING
+        self.store.save_plan(run.run_id, plan)
+        self.store.save_run(run)   # persist RUNNING + cleared approval before re-driving (crash-safe)
+        self._emit(run, "progress", "revising the draft with your changes")
+        return self._drive(run, goal)
+
     def _resume_escalated(self, run, goal, answer: str | None) -> RunState:
-        """An escalation is a PARKED conversation, not a dead end: the owner's reply either redirects
-        the run (re-architect the remaining work around their guidance) or closes it ("no" -> STOPPED).
-        The pending 'review' approval is the anchor the answer resolves. Continuing never widens
-        authorization — every new action still flows through the broker + read-back gate, and the
-        budget/deadline terminators still hold (no headroom -> honest refusal, stays parked)."""
+        """An escalation is a PARKED conversation, not a dead end: the owner's reply is classified into
+        an INTENT (P0.2) — confirmed / denied / retry / stop / guidance — and handled accordingly. The
+        pending 'review' approval is the anchor the answer resolves, and it carries the ``reason_code``
+        that says WHY the run escalated. Continuing never widens authorization — every new action still
+        flows through the broker + read-back gate, and the budget/deadline terminators still hold."""
         ans = answer if answer is not None else self._answer_for(run)
         if ans is None or not ans.strip():
             return run                                   # still waiting on the owner
-        # A BARE decline stops the run. A decline-prefixed sentence with substance ("no email needed,
-        # just finish the summary") is GUIDANCE — found live: a redirect that happened to start with
-        # "No" stopped the run instead of steering it. Guidance is the safe default here: it only
-        # replans (it can never authorize anything), and a plain "no"/"stop" still stops. This
-        # heuristic is escalation-only — per-action approvals keep strict yes/no parsing.
-        if parse_answer(ans)["decision"] == "no" and len(ans.split()) <= 3:
-            run.status = RunStatus.STOPPED
-            run.pending_approval = None
-            run.updated_at = now_ts()
+        reason_code = getattr(run.pending_approval, "reason_code", "") or ""
+        subject_keys = list(getattr(run.pending_approval, "subject_keys", ()) or ())
+        intent = self._classify_escalation_reply(ans, reason_code,
+                                                 getattr(run.pending_approval, "prompt", "") or "")
+        # confirmed/denied/retry only carry send meaning on a send-confirmation escalation (an unverifiable
+        # send, or a reverify-proven-missing correction). On any OTHER escalation type (owner_declined /
+        # connect / budget / generic step failure) they are meaningless, so they fall through to guidance —
+        # the classic replan — exactly as before P0.2. "retry" is gated the same as "denied": on a non-send
+        # escalation the replan naturally reads it as "try the failed step again", NOT as a send re-issue.
+        send_confirm = reason_code in ("needs_owner_confirm", "reverify_proven_missing")
+        if intent == "stop":
+            return self._stop_escalated(run)
+        if intent == "confirmed" and send_confirm:
+            return self._confirm_escalated(run, goal, subject_keys)
+        if send_confirm and intent in ("retry", "denied"):
+            return self._resend_escalated(run, goal, ans, subject_keys, denied=(intent == "denied"))
+        return self._guidance_escalated(run, goal, ans)
+
+    def _classify_escalation_reply(self, ans: str, reason_code: str, question: str) -> str:
+        """Map the owner's escalation reply to an intent. Deterministic shortcuts first (model-free);
+        otherwise ONE cheap model call (the ControlPlane.classify pattern — enum JSON schema, executor
+        role) that HARD-DEFAULTS to "guidance" on any error or non-conforming output. With Fake models the
+        call yields no valid JSON, so tests exercise the shortcuts and this default without a live model."""
+        intent = _deterministic_intent(ans, reason_code)
+        if intent is not None:
+            return intent
+        try:
+            resp = self.model.complete(
+                [{"role": "system", "content": _INTENT_SYSTEM},
+                 {"role": "user", "content": f"THE ASSISTANT ASKED:\n{question}\n\n"
+                                             f"THE OWNER REPLIED:\n{ans}"}],
+                role="executor",
+                response_format={"type": "json_schema",
+                                 "json_schema": {"name": "intent", "schema": _INTENT_SCHEMA}})
+            data = json.loads(resp.content)
+            if data.get("intent") in ("confirmed", "denied", "retry", "stop", "guidance"):
+                return data["intent"]
+        except Exception:
+            _log.exception("escalation intent classify failed; defaulting to guidance")
+        return "guidance"
+
+    def _pending_send_effects(self, run, subject_keys) -> list:
+        """The EXACT forwarded, not-yet-confirmed (``expected_present is None``) send effects an owner
+        attestation should correct — scoped to what THIS escalation was about, never a sibling effect.
+
+        When ``subject_keys`` is non-empty (the escalation stamped the ``action_id``s it asked about),
+        select precisely those records — so an owner "nothing arrived" on one send's escalation can never
+        flip a verification_broken send that is on its own +60s reverify track. When it is empty (a run
+        persisted before ``subject_keys`` existed), fall back to the pre-P0.2 predicate MINUS records with
+        ``detail['readback_error']``: a plain-unverifiable send is fair game, but a verification_broken one
+        (reported separately, re-checked on a timer) must never be swept in by the fallback."""
+        keys = set(subject_keys or ())
+        if keys:
+            return [e for e in self.store.get_effects(run.run_id) if e.action_id in keys]
+        return [e for e in self.store.get_effects(run.run_id)
+                if e.side_effecting and e.phase == "forwarded" and e.expected_present is None
+                and e.detail.get("grant_key") and not e.detail.get("readback_error")]
+
+    def _stop_escalated(self, run) -> RunState:
+        """Owner closed the escalation — STOPPED (the pre-P0.2 bare-'no' path, unchanged)."""
+        run.status = RunStatus.STOPPED
+        run.pending_approval = None
+        run.updated_at = now_ts()
+        self.store.save_run(run)
+        self.timers.cancel_for_run(run.run_id)
+        self._emit(run, "notify", "okay — leaving it here.")
+        return run
+
+    def _confirm_escalated(self, run, goal, subject_keys) -> RunState:
+        """The owner ATTESTED the escalated send went through — the strongest evidence we have when our own
+        read-back couldn't confirm it. Record that attestation on each subject send effect as a DISTINCT,
+        explicitly-owner-sourced ledger evidence class (``detail['verification'] = 'owner-confirmed'``,
+        set ONLY here, from a real owner reply) — NOT the strict top-level ``verification`` guard field and
+        NOT ``expected_present``, so ``verified_effects`` stays strict and the final report never claims an
+        independent read-back it doesn't have. The trust gate is untouched (``_gate_step`` treats an
+        owner-confirmed send as landed for step-completion, exactly like verification_broken).
+
+        The escalated send's step FAILED the gate; the attestation resolves it, so mark that step DONE.
+        If un-done plan steps REMAIN, don't hard-close (that would skip the rest of the plan and its
+        objective checks) — ack and RESUME the normal drive loop, letting step 2..N run and the run reach
+        DONE via ``_finalize`` like any other resume. Only when nothing remains do we close DONE here with
+        the friendly one-liner."""
+        for eff in self._pending_send_effects(run, subject_keys):
+            eff.detail["verification"] = "owner-confirmed"
+            self.store.update_effect(run.run_id, eff)
+        plan = self.store.get_plan(run.run_id)
+        if plan:
+            for s in plan.steps:                          # the attested send's step succeeded after all
+                if s.status is StepStatus.FAILED:
+                    s.status = StepStatus.DONE
+            self.store.save_plan(run.run_id, plan)
+        remaining = bool(plan) and any(
+            s.status not in (StepStatus.DONE, StepStatus.SKIPPED) for s in plan.steps)
+        run.pending_approval = None
+        run.updated_at = now_ts()
+        if remaining:
+            run.status = RunStatus.RUNNING
             self.store.save_run(run)
-            self.timers.cancel_for_run(run.run_id)
-            self._emit(run, "notify", "okay — leaving it here.")
-            return run
+            self._emit(run, "notify", "good to know — that went through. carrying on.")
+            return self._drive(run, goal)
+        run.status = RunStatus.DONE
+        self._release_run_resources(run)
+        self.store.save_run(run)
+        self.timers.cancel_for_run(run.run_id)   # drop any armed reverify — the owner has settled it
+        self._emit(run, "done", "great — all set then.")
+        return run
+
+    def _resend_escalated(self, run, goal, ans: str, subject_keys, *, denied: bool) -> RunState:
+        """The owner reports the escalated send never arrived (``denied``) or explicitly asked to try
+        again (``retry``). Record the honest correction on each subject send effect — its net outcome is
+        FAILURE: the API forwarded it, but the owner (the strongest available evidence) attests it never
+        landed. We flip BOTH ``expected_present=False`` and ``phase='failed'``, and it is the PHASE flip
+        that does the load-bearing work:
+          * ``expected_present=False`` alone already releases the grant-key from the operator's idempotency
+            re-seed — that re-seed keeps ``forwarded`` records whose ``expected_present is not False``
+            (:meth:`_broker`), so proving the effect missing drops it whether or not the phase changes.
+          * But a record left ``phase='forwarded'`` with ``expected_present=False`` is a PERMANENT hard
+            refuse in ``trustgate.classify_effects`` (a forwarded-but-proven-absent send) with NO
+            supersession path: ``landed_gks`` is seeded ONLY from ``forwarded`` + ``expected True`` records
+            and ``retryable_attempts`` ONLY from ``failed``/``attempted`` ones — so a forwarded+False
+            record can never be forgiven by a later verified resend, and the run could never clear the gate.
+            Flipping the phase to ``failed`` routes the record into ``retryable_attempts`` instead, where
+            the verified resend of the same identity (grant_key) supersedes it and the run can reach DONE.
+        (This is the reviewed correction to the P0.1 finding: the phase flip is about the gate's
+        supersession rule, not about the idempotency re-seed.) Then replan a retry path and drive it."""
+        for eff in self._pending_send_effects(run, subject_keys):
+            eff.phase = "failed"           # honest: forwarded, but owner-attested never-landed -> failed
+            eff.expected_present = False   # the strongest evidence (owner attestation) proves it absent
+            eff.detail["correction"] = "owner-reported-missing" if denied else "owner-requested-retry"
+            self.store.update_effect(run.run_id, eff)
+        reason = ("the owner reports the message never arrived" if denied
+                  else "the owner asked to try the send again")
+        return self._replan_from_escalation(
+            run, goal, reason=reason,
+            new_info=f"OWNER GUIDANCE: {ans}\nThe earlier send did NOT arrive — RE-SEND it (a genuine, "
+                     "fresh send of the same message).")
+
+    def _guidance_escalated(self, run, goal, ans: str) -> RunState:
+        """The classic path: fold the owner's guidance into a replan of the remaining work (it can never
+        authorize anything). A no-new-steps replan is handled by :meth:`_replan_from_escalation`."""
+        return self._replan_from_escalation(run, goal, reason="the owner replied to the escalation",
+                                            new_info=f"OWNER GUIDANCE: {ans}")
+
+    def _replan_from_escalation(self, run, goal, *, reason: str, new_info: str) -> RunState:
+        """Shared resume: refresh spend, enforce the budget/deadline terminator, then replan the remaining
+        work and drive it. A replan that yields NO new steps is not a dead end (P0.2) — see
+        :meth:`_close_or_plea`."""
         run.spent_usd = self.store.run_spend(run.run_id)   # refresh: spend may postdate the escalation
         if not self._has_headroom(run):
             self._emit(run, "notify",
@@ -552,19 +985,38 @@ class Operator:
         plan = self.store.get_plan(run.run_id)
         done_steps = [s for s in plan.steps if s.status is StepStatus.DONE] if plan else []
         newplan = self.planner.replan(
-            goal, done_steps,
-            reason="the owner replied to the escalation",
-            new_info=f"OWNER GUIDANCE: {ans}",
+            goal, done_steps, reason=reason, new_info=new_info,
             broker=self._broker(run), catalog=CAPABILITY_CATALOG,
             memory=self.store.get_memory())
         if len(newplan.steps) <= len(done_steps):
-            # The replan produced no new work — park again honestly rather than spin.
-            self._escalate(run, "I couldn't turn that into a next step — can you rephrase what "
-                                "you'd like me to do?")
-            return run
+            return self._close_or_plea(run, plan)
         self.store.save_plan(run.run_id, newplan)
         self._emit(run, "progress", "picking the run back up with your guidance")
         return self._drive(run, goal)
+
+    def _close_or_plea(self, run, plan) -> RunState:
+        """A replan produced no new work. DEFAULT (P0.2): close the run DONE with a friendly "nothing more
+        needed" — a no-op replan is the CORRECT outcome for a reply that needed no further action (the
+        incident dead-end treated this as failure). The rephrase plea survives ONLY as the exception: a
+        FIRST unparseable guidance on a run that GENUINELY still has pending (not-done) work, and never
+        twice in a row (tracked per-run in ``_guidance_pleaded``)."""
+        has_pending = bool(plan) and any(s.status is not StepStatus.DONE for s in plan.steps)
+        if has_pending and run.run_id not in self._guidance_pleaded:
+            self._escalate(run, "I couldn't turn that into a next step — can you rephrase what "
+                                "you'd like me to do?", reason_code="needs_rephrase")
+            # Set the flag AFTER _escalate: _escalate parks the run and clears its per-run caches
+            # (_release_run_resources), so setting it earlier would be wiped. Now it survives to the next
+            # reply — a second unparseable guidance closes DONE instead of pleading again.
+            self._guidance_pleaded.add(run.run_id)
+            return run
+        run.pending_approval = None
+        run.status = RunStatus.DONE
+        run.updated_at = now_ts()
+        self._release_run_resources(run)
+        self.store.save_run(run)
+        self.timers.cancel_for_run(run.run_id)
+        self._emit(run, "done", "nothing more needed — all set.")
+        return run
 
     def _park_connect(self, run, na) -> str:
         """Park a run that needs the user to CONNECT an account: AWAITING_CONNECT, emit a tappable connect
@@ -745,7 +1197,11 @@ class Operator:
         # critic (NOT the executor) checks the deliverable actually meets the owner's hard constraints. An
         # unsatisfied verdict becomes a redirectable refusal, so relentlessness keeps searching (or escalates
         # honestly) rather than reporting an unsatisfactory answer as done. Fail-open (never blocks on error).
-        if gate.accept and self._finishes_run(plan, step):
+        # FAST-PATH runs (P1.3) skip it: the detector only ever matches a goal with NO constraints (any
+        # constraint -> the full pipeline), and the send itself was just verified MECHANICALLY by the gate's
+        # read-back — there is nothing fuzzy left for a model critic to judge, and the skip is what holds
+        # the happy path at <=2 model calls. The deterministic gate above ran in full either way.
+        if gate.accept and self._finishes_run(plan, step) and not run.fast_path:
             deliverable = self._run_deliverable(plan, step, result)   # the run's actual answer, like _finalize
             ok, why = self.verifier.verify(goal, deliverable, broker=self._broker(run))
             if not ok:
@@ -757,6 +1213,11 @@ class Operator:
             step.params.pop("_ladder", None)
             step.params.pop("_box_baseline", None)
             self.store.save_plan(run.run_id, plan)
+            # A verification_broken send this step just forwarded completes the step (landed), but we
+            # never LEAVE it unconfirmed: arm ONE durable +60s re-check per broken send that re-runs the
+            # read-back once the broken tool may have recovered (see _reverify). The soft "I'll re-check"
+            # note rides on the final report (_finalize). Log ERROR so the operator sees the broken probe.
+            self._arm_reverify(run, [e for e in result.effects if _is_verification_broken(e)])
             self._emit(run, "progress", f"step {step.index + 1} done: {step.text}")
             return "advanced"
 
@@ -765,7 +1226,20 @@ class Operator:
             step.status = StepStatus.FAILED
             step.result = result
             self.store.save_plan(run.run_id, plan)
-            self._escalate(run, f"step {step.index + 1}: {gate.reason}")
+            # The unverifiable case gets a friendly, slug-free owner message; other refusals keep the
+            # precise "step N: <reason>" (they're redirect/diagnostic-facing, not the owner-confirm path).
+            # Stamp the escalation with the action_ids of the PLAIN-unverifiable sends it is about
+            # (forwarded + expected None + NO readback_error) — NOT any verification_broken send, which is
+            # reported separately and re-checked on its own +60s timer — so an owner reply flips only these.
+            subject = None
+            if gate.owner_prompt:
+                subject = tuple(e.action_id for e in self.store.get_effects(run.run_id)
+                                if e.side_effecting and e.phase == "forwarded"
+                                and e.expected_present is None and (e.detail or {}).get("grant_key")
+                                and not (e.detail or {}).get("readback_error"))
+            self._escalate(run, gate.owner_prompt or f"step {step.index + 1}: {gate.reason}",
+                           reason_code="needs_owner_confirm" if gate.owner_prompt else "",
+                           subject_keys=subject)
             return "escalated"
         return self._climb_ladder(run, goal, plan, step, gate.reason)
 
@@ -851,8 +1325,25 @@ class Operator:
 
     # ================================================================ the gate
     def _gate_step(self, run, step, result, sandbox) -> _GateOutcome:
-        effect_dicts = [e.as_gate_dict() for e in self.store.get_effects(run.run_id)]
+        effs = self.store.get_effects(run.run_id)
+        effect_dicts = [e.as_gate_dict() for e in effs]
         unver, unverifiable = trustgate.classify_effects(effect_dicts, claimed_done=result.claimed_done)
+        # verification_broken sends are FORWARDED-and-not-proven-missing (landed_effects semantics): the
+        # send went out, only our own read-back tool is broken. They must NOT drive an owner escalation
+        # (that is exactly the "couldn't confirm — can you double-check?" chore P0.1 removes); the +60s
+        # timer re-checks them instead. Drop their labels from the gate's unverifiable set so gate_verdict
+        # accepts the step. (verified_effects stays strict, so the final report never claims them verified;
+        # a genuinely no-read-back send — no readback_error — still escalates below.)
+        broken_labels = {e.label for e in effs if _is_verification_broken(e)}
+        # An OWNER-CONFIRMED send (attested via a needs_owner_confirm escalation reply, P0.2) is landed for
+        # step completion — the owner is the strongest evidence we have — so it must NOT re-escalate when a
+        # LATER step in the same run finishes and re-gates the ledger. Drop its labels from unverifiable
+        # exactly like a verification_broken send. verified_effects stays strict (owner-confirmed carries no
+        # expected fingerprint), so the final report still never claims it independently verified.
+        confirmed_labels = {e.label for e in effs if e.phase == "forwarded"
+                            and (e.detail or {}).get("verification") == "owner-confirmed"}
+        unverifiable = [lbl for lbl in unverifiable
+                        if lbl not in broken_labels and lbl not in confirmed_labels]
         bundle = self._bundle(run, sandbox, step)
         obj = trustgate.evaluate_objective_checks(step.done_criteria, bundle)
         stale = self._stale_files(step, sandbox, result)
@@ -869,7 +1360,8 @@ class Operator:
                 reason = f"{reason} — {detail}"
         # A stale read / reliability flag is a REDO, not an owner-confirm — keep needs_owner False there.
         needs_owner = bool(unverifiable) and not unver and not obj and not stale and not breaking
-        return _GateOutcome(accept=accept, reason=reason, needs_owner=needs_owner)
+        owner_prompt = _unverifiable_owner_msg(unverifiable) if needs_owner else ""
+        return _GateOutcome(accept=accept, reason=reason, needs_owner=needs_owner, owner_prompt=owner_prompt)
 
     def _gate_breaking(self, step, result, effect_dicts) -> list:
         """Compute the in-flight reliability-signature census and confirm which still contradict the
@@ -949,11 +1441,18 @@ class Operator:
             si = step.index
             effs = [e for e in effs
                     if e.detail.get("step_index") is None or e.detail.get("step_index") == si]
-        verified = trustgate.verified_effects([e.as_gate_dict() for e in effs])
+        gate_dicts = [e.as_gate_dict() for e in effs]
+        # effect_landed rests on ``landed_effects`` (forwarded & not proven-missing — verified OR
+        # honestly unverifiable), so a provider-accepted send whose read-back was scope-blocked does NOT
+        # force a blind retry (a duplicate send). ``verified_effects`` (strict) is kept for any consumer
+        # that needs independent confirmation.
+        landed = trustgate.landed_effects(gate_dicts)
+        verified = trustgate.verified_effects(gate_dicts)
         # The URLs this run actually fetched through the proxy — lets the gate's source_membership check
         # refuse a deliverable that cites a source the run never retrieved (anti-citation-fabrication).
         fetched = sorted(self._fetched.get(run.run_id, set()))
-        return {"files": files, "texts": texts, "fetched_urls": fetched, "verified_effects": verified}
+        return {"files": files, "texts": texts, "fetched_urls": fetched,
+                "landed_effects": landed, "verified_effects": verified}
 
     # ================================================================ waiting / await / monitor
     def _park_wait(self, run, plan, step, *, kind: str):
@@ -1306,6 +1805,7 @@ class Operator:
         self._fetched.pop(run.run_id, None)   # drop the run's fetched-URL set (no cross-run leak)
         self._discovered.pop(run.run_id, None)   # drop provenance-admitted recipients (no cross-run leak)
         self._connect.pop(run.run_id, None)   # drop any parked-on-connect state (terminal run)
+        self._guidance_pleaded.discard(run.run_id)   # drop the rephrase-plea flag (terminal run)
 
     def _finalize(self, run, plan) -> RunState:
         run.status = RunStatus.DONE
@@ -1327,23 +1827,164 @@ class Operator:
                   f"{', '.join(verified) if verified else '(none)'}; spent ${run.spent_usd:.2f}.")
         report = (f"Done: {run.goal_text}\n\n{deliverable}\n\n— {status}" if deliverable
                   else f"Done: {run.goal_text}\n{status}")
+        # verification_broken sends completed the run (landed) but our own delivery-check tooling failed
+        # on them. Note that ONCE, in plain reply-style voice — the provider ACCEPTED the send (delivery
+        # is exactly what we can't confirm), the CHECK hiccuped, and we'll re-verify on a timer (only
+        # pinging back if something's actually wrong). Never a chore.
+        broken = sorted({e.label for e in effs if _is_verification_broken(e)})
+        if broken:
+            clauses = []
+            for lbl in broken:
+                c = _friendly_effect_clause(lbl)
+                if c not in clauses:
+                    clauses.append(c)
+            did = (clauses[0] if len(clauses) == 1
+                   else ", ".join(clauses[:-1]) + f" and {clauses[-1]}")
+            report += (f"\n\n(Heads up: I {did} and it was accepted, but I couldn't confirm delivery on my "
+                       f"end — I'll re-verify shortly and only flag you if something's actually off.)")
         self._emit(run, "done", report)
         return run
 
-    def _escalate(self, run, reason: str, *, reason_code: str = ""):
+    def _arm_reverify(self, run, broken_effects) -> None:
+        """Arm ONE durable +60s re-check per verification_broken send (P0.1c). The payload carries just
+        enough to re-run the INDEPENDENT read-back later (toolkit/action/params/label/grant_key). Logged
+        at ERROR so the operator sees the broken self-verification tooling; the owner is NOT bothered now
+        — only if the re-check later PROVES the send missing. No re-send is ever issued from here."""
+        for e in broken_effects or []:
+            payload = {"toolkit": e.toolkit, "action": e.action, "label": e.label,
+                       "params": (e.detail or {}).get("readback_params") or {},
+                       "grant_key": (e.detail or {}).get("grant_key", "")}
+            self.timers.schedule(run_id=run.run_id, wake_at=self.timers.now() + _REVERIFY_DELAY_S,
+                                 kind="reverify", payload=payload)
+            _log.error("verification_broken: %s forwarded on run %s but self-verify read-back failed "
+                       "(%s) — armed a +%ss re-check", e.label, run.run_id,
+                       (e.detail or {}).get("readback_error"), int(_REVERIFY_DELAY_S))
+
+    def reverify(self, run_id: str, payload: dict) -> RunState | None:
+        """Timer entry point (control-plane tick): re-run a verification_broken send's INDEPENDENT
+        read-back now that the broken tool may have recovered. Serialized on the per-run lock like any
+        other resume so it can't race a concurrent drive."""
+        with self._locked_run(run_id):
+            return self._reverify(run_id, payload or {})
+
+    def _reverify(self, run_id: str, payload: dict) -> RunState | None:
+        run = self.store.get_run(run_id)
+        if run is None:
+            return None
+        toolkit = str(payload.get("toolkit") or "")
+        action = str(payload.get("action") or "")
+        params = payload.get("params") or {}
+        label = str(payload.get("label") or f"{toolkit}:{action}")
+        # Re-run the read-back ONLY (this NEVER re-sends — it just OBSERVES). Prefer snapshot_probe so we
+        # can still tell a broken probe apart from a legitimately-empty surface.
+        probe = getattr(self.integrations, "snapshot_probe", None)
+        if callable(probe):
+            try:
+                after, err = probe(toolkit=toolkit, action=action, params=params,
+                                   user_id=runtime.local_user())
+            except Exception as exc:  # noqa: BLE001
+                after, err = None, f"{type(exc).__name__}: {exc}"
+        else:
+            after, err = (self.integrations.snapshot(toolkit=toolkit, action=action, params=params,
+                                                     user_id=runtime.local_user()), None)
+        if after is None:
+            # STILL broken — the read-back tool has not recovered. Just record it (log ERROR); no owner
+            # message beyond the original soft note. The send already went out; we simply still can't
+            # confirm it, and asking the owner to check would be the very chore P0.1 removes.
+            _log.error("reverify: read-back still failing for %s on run %s (%s)", label, run_id, err)
+            return run
+        fp = self.integrations.fingerprint(toolkit=toolkit, action=action, params=params)
+        # PRESENCE check against a fresh read-back (empty baseline -> every current item is "added"), so
+        # a fingerprint match means the message really is in the Sent surface now.
+        present = effects.has_expected_effect({}, after, fp)
+        if present is False:
+            if run.status is RunStatus.STOPPED:
+                # The owner already CLOSED this run. A proven-missing re-check must NOT re-open it with a
+                # fresh escalation — that would drag the owner back into a conversation they ended. Record
+                # it loudly (log ERROR) and leave the run stopped. (DONE — the designed case — and an
+                # already-ESCALATED run still escalate below.)
+                _log.error("reverify: %s PROVEN MISSING on the +%ss re-check for run %s, but the run is "
+                           "STOPPED — not re-escalating", label, int(_REVERIFY_DELAY_S), run_id)
+                return run
+            # PROVEN MISSING on a valid probe: the send did NOT actually land. Real failure — notify the
+            # owner honestly (we'd earlier reported it delivered). This re-opens the run for their reply.
+            # Stamp the escalation with THIS send's own effect record (resolved from the reverify payload's
+            # grant_key) so an owner reply flips ONLY it — never a plain-unverifiable sibling on the run. If
+            # resolution fails (no grant_key / no match), stamp nothing: the empty-subject fallback then
+            # excludes verification_broken records, so nothing of this reverify's is flipped by mistake.
+            gk = str(payload.get("grant_key") or "")
+            subject = tuple(e.action_id for e in self.store.get_effects(run_id)
+                            if e.side_effecting and e.phase == "forwarded" and e.expected_present is None
+                            and gk and (e.detail or {}).get("grant_key") == gk) if gk else ()
+            self._escalate(run, _reverify_missing_msg([label]), reason_code="reverify_proven_missing",
+                           subject_keys=subject)
+            return run
+        # present is True (confirmed) or None (no fingerprint -> indeterminate): just record it. The send
+        # is confirmed or unconfirmable and the owner already got the soft note — no further message.
+        _log.info("reverify: %s re-check %s for run %s", label,
+                  "verified" if present else "indeterminate", run_id)
+        return run
+
+    def _escalate(self, run, reason: str, *, reason_code: str = "", subject_keys=None):
         """Park the run on the owner as a REVIEW question — an escalation is a parked conversation the
         owner can answer to continue (see ``_resume_escalated``), never a dead end. ``reason_code`` is a
         machine-readable tag (``model_error`` / ``budget_exhausted`` / ``owner_declined`` / ... ) riding
-        alongside the human text so the dashboard and tests can branch on WHY without parsing prose."""
-        apr = ApprovalRequest(run_id=run.run_id, kind="review", prompt=reason, options=[])
+        alongside the human text so the dashboard and tests can branch on WHY without parsing prose.
+        ``subject_keys`` are the effect ``action_id``s a send-confirmation escalation is about (P0.2), so a
+        confirm/deny/retry reply corrects ONLY those records."""
+        apr = ApprovalRequest(run_id=run.run_id, kind="review", prompt=reason, options=[],
+                              reason_code=reason_code, subject_keys=tuple(subject_keys or ()))
         run.pending_approval = apr
         run.status = RunStatus.ESCALATED
         run.updated_at = now_ts()
         self._release_run_resources(run)   # parked: free the browser session (a resume re-creates one)
+        # Zombie-run reaper (P1.1): arm a durable timer keyed to THIS escalation's approval id. If the
+        # owner never answers, tick() routes it to reap() after escalation_ttl_h (24h default) and closes
+        # the run quietly. The apr.id identity makes a stale timer harmless: answering, finishing, stopping,
+        # or RE-escalating (a fresh apr.id carrying its OWN fresh reap timer) all leave this one a no-op —
+        # so re-escalating naturally re-arms and each escalation is reaped only on its own clock.
+        # Ordering (I4): schedule the reaper BEFORE persisting the run/approval. A crash between the two
+        # then leaves a timer whose apr.id never matches a saved escalation — a harmless no-op via the
+        # identity guard in ``_reap``. The reverse order (save first) could persist an ESCALATED run with
+        # NO reaper if we crashed before scheduling — a permanent zombie, the exact failure P1.1 kills.
+        self.timers.schedule(run_id=run.run_id, wake_at=self.timers.now() + self.escalation_ttl_h * 3600.0,
+                             kind="reap", payload={"apr_id": apr.id})
         self.store.save_approval(apr)
         self.store.save_run(run)
         extra = {"reason_code": reason_code} if reason_code else {}
         self._emit(run, "escalated", reason, **extra)
+
+    def reap(self, run_id: str, payload: dict) -> RunState | None:
+        """Timer entry point (control-plane tick): the zombie-run reaper (P1.1). An escalation the owner
+        never answered is a dead conversation cluttering the dashboard; after ``escalation_ttl_h`` close it
+        quietly. Serialized on the per-run lock like any other resume so it can't race a concurrent answer
+        or drive."""
+        with self._locked_run(run_id):
+            return self._reap(run_id, payload or {})
+
+    def _reap(self, run_id: str, payload: dict) -> RunState | None:
+        run = self.store.get_run(run_id)
+        if run is None:
+            return None
+        apr = run.pending_approval
+        # Identity check: reap ONLY a run STILL parked on the EXACT escalation this timer was armed for. If
+        # the owner answered / the run finished / it was stopped (status moved off ESCALATED), or it
+        # RE-escalated with a different question (a new apr.id — carrying its own fresh reap timer), this
+        # stale timer is a harmless no-op. The newer escalation, if any, has its own reaper.
+        if run.status is not RunStatus.ESCALATED or apr is None or apr.id != payload.get("apr_id"):
+            return None
+        # An answer just landed but hasn't been resumed yet (the owner replied at the TTL boundary): don't
+        # reap a live conversation — the pending resume will handle it.
+        if self._answer_for(run) is not None:
+            return None
+        run.status = RunStatus.STOPPED
+        run.pending_approval = None
+        run.updated_at = now_ts()
+        self._release_run_resources(run)
+        self.store.save_run(run)
+        self.timers.cancel_for_run(run.run_id)   # the run is closed — drop any timers it still holds
+        self._emit(run, "notify", "closing this out — ping me if you still want it.")
+        return run
 
     # ================================================================ helpers
     def _available_tools(self) -> list:
@@ -1391,6 +2032,7 @@ class Operator:
         return Broker(model=self.model, search=self.search, integrations=self.integrations,
                       browser=self.browser, overrides=self.overrides,
                       mandate=mandate, mandate_counts=run.mandate_counts,
+                      mandate_auto=bool(run.mandate_auto), send_preview=self.send_preview,
                       trust=self.store.get_trust(), on_usage=on_usage,
                       # Pre-call heartbeats -> ordinary progress events: the dashboard's timeline
                       # animates DURING a long model/tool call instead of looking frozen for minutes.

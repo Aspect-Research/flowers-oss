@@ -19,8 +19,8 @@ def test_actions_and_arcade_tools_keysets_match():
 
 
 def test_catalog_actions_are_all_routable():
-    # Every capability the planner/executor is TOLD about must be routable through the Arcade recipe table
-    # (else the model could emit a label that dead-ends). Catalog (toolkit, action) ⊆ _ARCADE_TOOLS keys.
+    # Every capability the planner/executor is TOLD about must be routable through the Arcade recipe
+    # table — else the model could emit a label that dead-ends.
     catalog_keys = {(c["toolkit"], c["action"]) for c in CAPABILITY_CATALOG}
     assert catalog_keys <= set(_ARCADE_TOOLS)
 

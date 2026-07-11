@@ -35,6 +35,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from flowers import policy
@@ -306,14 +307,250 @@ def admitted_from_fetch(events) -> set[str]:
     return out
 
 
+# Quoted/forwarded-content markers: an address the owner QUOTED or FORWARDED (not their own instruction)
+# must NOT count as owner-named — else a forwarded "From: attacker@evil.com" header would make the sender
+# auto-authorized. Deterministic, line-based stripping (below). A header-shaped line ("From:"/"To:"/...).
+_QUOTE_HEADER_RE = re.compile(r"^\s*(?:from|to|cc|bcc|sent|date|subject|reply-to)\s*:", re.IGNORECASE)
+# A line that BEGINS a forwarded/quoted region — that line and everything AFTER it is quoted content.
+_FORWARD_MARKER_RE = re.compile(
+    r"^\s*(?:-+\s*forwarded message\s*-+|begin forwarded message:|on\b.+\bwrote:)\s*$", re.IGNORECASE)
+
+
+def _strip_quoted(text: str) -> str:
+    """Drop quoted/forwarded content so an email appearing ONLY inside a quoted or forwarded block is not
+    read as owner-named. Deterministic, line-based:
+      * a line starting ">" or "|" (a quote gutter) is dropped;
+      * a header-shaped line (From:/To:/Cc:/Bcc:/Sent:/Date:/Subject:/Reply-To:) — a forwarded/reply
+        header, not the owner's words — is dropped;
+      * a forwarded-message marker line ("---- Forwarded message ----", "Begin forwarded message:",
+        "On ... wrote:") ends the owner's own text: that line and EVERYTHING after it is dropped.
+    What remains is the owner's direct instruction (before any forward, outside any quote). A false strip
+    only makes an address fall to the CARD path — the safe direction (parse_mandate uses this too)."""
+    kept: list[str] = []
+    for line in str(text or "").splitlines():
+        s = line.strip()
+        if _FORWARD_MARKER_RE.match(s):
+            break                                    # this line + everything below is forwarded/quoted
+        if s.startswith(">") or s.startswith("|"):
+            continue                                 # a quote gutter
+        if _QUOTE_HEADER_RE.match(s):
+            continue                                 # a forwarded/reply header line
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def goal_named_recipients(goal) -> set[str]:
     """The email addresses the owner literally wrote in the goal (text + constraint values). These are
     ALWAYS unioned into ``recipient_scope`` so a recipient the owner named is in scope even if the model
-    omitted it. Emails only — we never INFER a domain from prose (too permissive)."""
+    omitted it. Emails only — we never INFER a domain from prose (too permissive).
+
+    Quoted/forwarded content is STRIPPED first (:func:`_strip_quoted`), so an address that appears only
+    inside a message the owner forwarded/quoted (e.g. a "From: attacker@evil.com" header) is NOT owner-
+    named — it falls to the autonomy CARD instead of auto-committing a silent send under preview=never.
+
+    Note: the owner's CLARIFIER answers land in ``goal.constraints`` (the operator stores a clarifying
+    reply as ``goal.constraints['clarification']``), so a recipient the owner typed in a clarification
+    reply is ALREADY named-by-owner here — it came from the owner's own words, not free model text."""
     parts = [str(getattr(goal, "text", "") or "")]
     for v in (getattr(goal, "constraints", {}) or {}).values():
         parts.append(str(v))
-    return {m.lower() for m in _EMAIL_RE.findall(" ".join(parts))}
+    clean = _strip_quoted("\n".join(parts))
+    return {m.lower() for m in _EMAIL_RE.findall(clean)}
+
+
+# Imperative words that NAME an outbound delivery the owner is asking for — the goal's own command a
+# send action_type must correspond to for OWNER-GRANT auto-commit (P0.3a). A superset of the delivering
+# verbs plus the plain-English send words a person texts ("email", "message", "tell", "reply", ...). We
+# require one of these in the goal so we never auto-authorize a send the owner merely made possible (named
+# an address) but never asked for.
+_SEND_IMPERATIVES = _DELIVERING_VERBS | frozenset({
+    "email", "emails", "emailed", "message", "messaged", "msg", "text", "write", "respond", "notify",
+    "tell", "contact", "ping", "let",   # "let X know"
+})
+
+
+def _goal_words(goal) -> set[str]:
+    """The lowercase word tokens of the goal text + every constraint value (incl. the owner's clarifier
+    reply). Linear, no backtracking regex."""
+    parts = [str(getattr(goal, "text", "") or "")]
+    for v in (getattr(goal, "constraints", {}) or {}).values():
+        parts.append(str(v))
+    return set(re.findall(r"[a-z]+", " ".join(parts).lower()))
+
+
+def owner_grant(proposed: dict, goal) -> dict | None:
+    """OWNER-GRANT (P0.3a): if the planner-proposed ``proposed`` mandate is ENTIRELY covered by what the
+    owner literally named — so the goal itself IS the authorization and no autonomy card is needed —
+    return the TIGHT mandate to auto-commit (scoped to exactly the owner-named recipients, one send each).
+    Otherwise return None -> the owner sees the card, exactly as before. This NEVER widens scope.
+
+    Every condition must hold (fail-closed -> None on any miss):
+      * a non-empty mandate with >= 1 action_type;
+      * EVERY action_type is a delivering SEND class (:func:`is_recipient_bearing` — gmail/slack send/
+        reply/forward/...), so a money/delete/cancel/trash/label or any non-send action keeps the card +
+        per-action ASK (verified against policy: money/NEVER are already dropped by :func:`parse_mandate`;
+        trash/label are ASK but not delivering, so they fall here);
+      * the goal's own imperative names that delivery (a send verb / 'email' appears in the goal text OR
+        the owner's OWN clarifier reply — both live on ``goal`` via :func:`_goal_words`);
+      * there is >= 1 owner-named recipient, and recipient_scope ⊆ those named recipients, every scope
+        entry an owner-named EMAIL (never a domain, never an un-named/discovered address).
+
+    Counts are set to the goal's plain meaning — one send per named recipient — by construction, never
+    trusting the model's proposed caps (which could be wider)."""
+    if not proposed:
+        return None
+    types = [_norm_label(t) for t in (proposed.get("action_types") or [])]
+    types = [t for t in types if ":" in t]
+    if not types:
+        return None
+    for lbl in types:
+        tk, _, act = lbl.partition(":")
+        if not (tk and act) or not is_recipient_bearing(tk, act):
+            return None                                  # a non-delivering (or delete/cancel) class -> card
+    if not (_goal_words(goal) & _SEND_IMPERATIVES):
+        return None                                      # the goal never asked to send -> card
+    named = goal_named_recipients(goal)
+    if not named:
+        return None                                      # no owner-named recipient -> card
+    scope = _dedup_lower(s for s in (_sanitize_scope_entry(r) for r in
+                                     (proposed.get("recipient_scope") or [])) if s)
+    if not scope or any(s not in named for s in scope):
+        return None                                      # a domain / un-named recipient -> broader -> card
+    n = len(scope)
+    return {
+        "action_types": types,
+        "recipient_scope": scope,
+        # tight by construction: exactly the named recipients, ONE send each — never widened.
+        "magnitude_caps": {"max_sends": n, "per_domain": n, "per_recipient": 1},
+        "irreversibility_ceiling": "ASK",
+        "done_definition": str(proposed.get("done_definition") or "").strip()[:500],
+        "undo_seconds": 0,   # the draft preview is the single touch for an owner-granted send, not undo
+    }
+
+
+# --------------------------------------------------------------------------- single-action fast path (P1.3)
+# The ONE shape that dominates real single-owner use: "send an email to <one owner-named address> saying
+# <concrete content>". When :func:`fast_path_goal` matches, the operator skips the clarifier + the planner
+# LLM call and drives a deterministic compose->send template plan, so the owner-visible flow (auto-mandate
+# -> draft preview -> send -> verified) costs <=2 model calls instead of ~5. CONSERVATIVE by construction
+# (false-negative-friendly): ANYTHING off — more than one recipient, no concrete content, a second task
+# ("... and then archive ..."), a pre-existing hard constraint, a non-gmail class — returns None and the
+# UNCHANGED full pipeline runs. It never widens scope or authorizes on its own: the matched send still rides
+# owner_grant + the draft preview + the read-back gate, exactly as P0.3 built.
+
+# A content-introducing clause — the owner said WHAT to send, not just whom to. Matched on the cleaned owner
+# text (quotes/forwards already stripped). Linear alternation, no backtracking.
+_CONTENT_INTRO_RE = re.compile(
+    r"\b(?:saying|say(?:s|\s+that)?|to\s+say|that\s+says|tell(?:ing)?\s+(?:them|him|her|everyone|that)|"
+    r"about|regarding)\b[:\-]?\s*(.+)", re.IGNORECASE | re.DOTALL)
+# A quoted payload of real substance also counts as concrete content.
+_QUOTED_RE = re.compile(r"[\"'“”‘’](.{2,}?)[\"'“”‘’]", re.DOTALL)
+# Connective phrases that signal a SECOND task after the send (a compound goal) — fail closed to the full
+# pipeline so the extra task is never silently dropped. Conservative: a legitimate message that merely
+# contains "and then" simply falls through (a harmless false negative).
+_COMPOUND_MARKERS = (" and then ", " then ", " also ", " afterwards", " after that", " as well as ", " plus ")
+# Inbox-management verbs whose presence means the goal asks for MORE than the single send ("email X and
+# archive Y"). Deliberately a SMALL, high-signal set (unlikely inside a normal outbound message) — the
+# connective markers above catch the rest.
+_OTHER_TASK_VERBS = frozenset({"archive", "delete", "trash", "unsubscribe", "label"})
+# A SECOND imperative chained onto the send by a BARE " and " / ", " ("email X saying hi AND message the
+# team", "email X saying hi, REMIND me to call") — the plain markers above only catch "and then"/"also"-
+# style joins, so a bare "and"/"," needs a following verb to disambiguate a real second task from a
+# content-internal "and" ("saying hi and thanks"). Deliberately BROADER than the inbox set (the outbound +
+# scheduling actions a person chains after a send) yet kept small + high-signal. Decline direction only: a
+# false positive just runs the full pipeline (harmless); a false NEGATIVE silently drops the second task.
+_SECOND_TASK_VERBS = frozenset({
+    "message", "text", "post", "slack", "remind", "schedule", "call", "book",
+    "reply", "forward", "create", "add", "set",
+})
+_SECOND_TASK_RE = re.compile(
+    r"(?:\band\b|,)\s+(?:" + "|".join(sorted(_SECOND_TASK_VERBS)) + r")\b", re.IGNORECASE)
+
+
+@dataclass
+class FastSend:
+    """A matched single-action delivering send: the ONE owner-named recipient and the send label the
+    operator's template plan will target. Returned by :func:`fast_path_goal` only for an unambiguous,
+    self-contained 'email <one address> saying <content>' — otherwise None (the full pipeline runs)."""
+    recipient: str
+    action_label: str = "gmail:GMAIL_SEND_EMAIL"
+
+
+def _fast_owner_text(goal) -> str:
+    """The owner's DIRECT text (goal text + constraint values, quotes/forwards stripped) — the material
+    both the content and compound checks read. Same stripping as :func:`goal_named_recipients`."""
+    parts = [str(getattr(goal, "text", "") or "")]
+    for v in (getattr(goal, "constraints", {}) or {}).values():
+        parts.append(str(v))
+    return _strip_quoted("\n".join(parts))
+
+
+def _fast_has_content(clean: str, recipient: str) -> bool:
+    """True iff the goal carries a concrete message payload beyond the imperative + address — a
+    'saying/that says/tell them/about/:'-introduced clause or quoted text of real substance. Fail-closed:
+    a bare 'email marc@acme.com' (no payload) is False, so it falls to the full pipeline."""
+    t = re.sub(re.escape(recipient), " ", clean, flags=re.IGNORECASE)   # drop the address itself
+    q = _QUOTED_RE.search(t)
+    if q and len(q.group(1).strip()) >= 2:
+        return True
+    m = _CONTENT_INTRO_RE.search(t)
+    if m and len(re.sub(r"[^a-z0-9]", "", m.group(1).lower())) >= 2:
+        return True
+    if ":" in t:                                       # a ':'-introduced payload ("...: meeting at 3pm")
+        after = t.rsplit(":", 1)[1]
+        if len(re.sub(r"[^a-z0-9]", "", after.lower())) >= 2:
+            return True
+    return False
+
+
+def _fast_is_compound(clean: str) -> bool:
+    """True iff the goal names a SECOND task after the send — a connective phrase, an inbox-management verb,
+    or a bare " and "/", "-joined second imperative — so the one-step template never silently drops it. Fail
+    closed to the full pipeline: false positives are harmless (they just take the full pipeline)."""
+    low = clean.lower()
+    if any(mark in low for mark in _COMPOUND_MARKERS):
+        return True
+    if set(re.findall(r"[a-z]+", low)) & _OTHER_TASK_VERBS:
+        return True
+    # A bare " and "/", " + a second imperative verb, scanned in the region AFTER the content intro (so a
+    # content-internal "and message me back" in the message body doesn't over-decline). No content intro
+    # yet -> scan the whole text: a second verb there ("email X 'note' and remind me ...") is still a
+    # second task, and a false decline is the safe direction anyway.
+    m = _CONTENT_INTRO_RE.search(clean)
+    tail = m.group(1) if m else clean
+    return bool(_SECOND_TASK_RE.search(tail))
+
+
+def fast_path_goal(goal) -> FastSend | None:
+    """Single-action fast-path detector (P1.3). Returns a :class:`FastSend` iff the goal is ONE delivering
+    email to exactly ONE owner-named recipient with concrete content and no second task; else None (the
+    unchanged full pipeline runs). Deterministic, no LLM. Conservative / false-negative-friendly — any
+    doubt returns None. Never widens scope: a matched send still rides owner_grant + the draft preview +
+    the read-back gate. Every condition must hold (fail-closed -> None on any miss):
+
+      * NO pre-existing hard constraint (a constraint is a pass/fail requirement the independent verifier
+        must judge — never fast-path past it; the clarifier reply also lands in constraints, so a
+        clarified goal correctly falls through here);
+      * exactly ONE owner-named recipient (:func:`goal_named_recipients` — emails only, quotes stripped),
+        which — being an email — is a gmail class (a slack channel / browser host never appears here);
+      * the goal's own imperative names a send (:data:`_SEND_IMPERATIVES`, the owner_grant vocabulary);
+      * NO second task ('... and then archive ...', an inbox-management verb, or a bare " and "/", "-joined
+        second imperative like '... and message the team' / '..., remind me to call');
+      * concrete content is present (a message payload beyond the imperative + address)."""
+    if goal is None or getattr(goal, "constraints", None):
+        return None
+    named = goal_named_recipients(goal)                # emails only, quotes/forwards already stripped
+    if len(named) != 1:
+        return None                                    # zero (no recipient) or >1 (multi-send) -> full pipeline
+    recipient = next(iter(named))
+    if not (_goal_words(goal) & _SEND_IMPERATIVES):
+        return None                                    # the goal never asked to send -> full pipeline
+    clean = _fast_owner_text(goal)
+    if _fast_is_compound(clean):
+        return None                                    # a second task -> full pipeline (never drop it)
+    if not _fast_has_content(clean, recipient):
+        return None                                    # no concrete payload -> full pipeline
+    return FastSend(recipient=recipient)
 
 
 # --------------------------------------------------------------------------- the counter
@@ -491,27 +728,55 @@ def undo_seconds(value) -> int:
         return 0
 
 
+def _oxford(items: list[str]) -> str:
+    """Join a short list the way a person would: 'a', 'a and b', 'a, b, and c'."""
+    xs = [str(x) for x in items if str(x).strip()]
+    if not xs:
+        return ""
+    if len(xs) == 1:
+        return xs[0]
+    if len(xs) == 2:
+        return f"{xs[0]} and {xs[1]}"
+    return ", ".join(xs[:-1]) + f", and {xs[-1]}"
+
+
+def _humanize_types(types: list[str]) -> str:
+    """Turn action-type labels into a plain-English verb phrase — 'send the email', 'push the code' —
+    never the raw ``toolkit:ACTION`` slug."""
+    out: list[str] = []
+    for t in types:
+        a = str(t).upper()
+        if "GMAIL" in a and "SEND" in a:
+            phrase = "send the email"
+        elif "CALENDAR" in a and ("CREATE" in a or "ADD" in a):
+            phrase = "add the calendar event"
+        else:
+            phrase = str(t).split(":")[-1].replace("_", " ").strip().lower() or "handle this"
+        if phrase not in out:
+            out.append(phrase)
+    return _oxford(out) if out else "handle this"
+
+
 def render_card(mandate: dict) -> str:
-    """The owner-facing approval card — the ONE consolidated 'grant this autonomy?' prompt that replaces
-    the per-action prompts."""
+    """The owner-facing autonomy prompt — the ONE consolidated 'mind if I run with it?' text that
+    replaces per-action approvals. Conversational, like a friend asking over text: no slugs, no
+    bullet dump, no bold."""
     if not mandate:
-        return "No special autonomy requested; I'll ask before each action."
+        return "No special autonomy needed — I'll ask before each action."
     types = mandate.get("action_types") or []
     scope = mandate.get("recipient_scope") or []
     caps = mandate.get("magnitude_caps") or {}
-    lines = [
-        "Here's the autonomy I'd like for this run (approve once, then I won't ask per action):",
-        "  • I can: " + (", ".join(types) if types else "(nothing)"),
-        "  • Only to: " + (", ".join(scope) if scope else "(no recipients in scope)"),
-        f"  • Up to: {caps.get('max_sends', '?')} sends total, "
-        f"{caps.get('per_recipient', '?')} per recipient, {caps.get('per_domain', '?')} per domain",
-        "  • I will NOT spend money or do anything irreversible (delete/pay/cancel) without asking you each time.",
-    ]
-    done = (mandate.get("done_definition") or "").strip()
-    if done:
-        lines.append(f"  • Done when: {done}")
+    doing = _humanize_types(types)
+    who = f" to {_oxford(scope)}" if scope else ""
+    parts = [f"Mind if I {doing}{who} without checking in on every step?"]
+    n = caps.get("max_sends")
+    if isinstance(n, int) and n:
+        keep = f"I'll keep it to {n} send{'' if n == 1 else 's'}"
+        keep += " and nothing outside that." if scope else "."
+        parts.append(keep)
+    parts.append("I won't spend money or delete/cancel anything without asking you first.")
     undo = int(mandate.get("undo_seconds") or 0)
     if undo > 0:
-        lines.append(f"  • I'll pause {undo}s before each send so you can text STOP to cancel it.")
-    lines.append("Reply YES to grant this, or NO to keep approving each action individually.")
-    return "\n".join(lines)
+        parts.append(f"I'll wait {undo}s before each send so you can text STOP to hold off.")
+    parts.append("Say yes and I'll run with it, or no and I'll check with you before each action.")
+    return " ".join(parts)

@@ -71,6 +71,63 @@ def _role_config_from_env() -> dict[str, dict] | None:
     return parsed
 
 
+def _verify_polling(*, live: bool) -> tuple[int, float]:
+    """Read-back polling for effect verification -> ``(attempts, delay_seconds)``.
+
+    A live provider indexes a just-written effect with a few seconds' lag (Gmail's Sent label is the
+    canonical case), so the LIVE default polls a few times with a short delay rather than a single
+    instant check — otherwise a real send reads back as absent/unverifiable and falsely escalates
+    ("I sent it but couldn't confirm it landed"). Offline the fakes are instant + deterministic, so it
+    stays a single check to keep the suite fast and $0. FLOWERS_VERIFY_ATTEMPTS / FLOWERS_VERIFY_DELAY
+    override either default; invalid values fall back rather than crash at import."""
+    attempts_default, delay_default = (4, 1.5) if live else (1, 0.0)
+
+    def _int(name: str, default: int) -> int:
+        raw = runtime.env(name)
+        try:
+            return max(1, int(raw)) if raw not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    def _float(name: str, default: float) -> float:
+        raw = runtime.env(name)
+        try:
+            return max(0.0, float(raw)) if raw not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    return _int("FLOWERS_VERIFY_ATTEMPTS", attempts_default), _float("FLOWERS_VERIFY_DELAY", delay_default)
+
+
+def _send_preview() -> str:
+    """The draft-preview mode for OWNER-GRANT (auto-committed) sends -> ``"always"`` (default) shows the
+    outgoing draft as the single owner confirm; ``"never"`` sends it directly (zero touches). Set via
+    FLOWERS_SEND_PREVIEW; any other value falls back to the safe default rather than crash at import."""
+    return "never" if runtime.env("FLOWERS_SEND_PREVIEW").lower() == "never" else "always"
+
+
+def _escalation_ttl_h(*, default: float = 24.0) -> float:
+    """Hours an ESCALATED run may sit unanswered before the zombie-run reaper closes it (P1.1).
+    FLOWERS_ESCALATION_TTL_H overrides; non-positive / invalid values fall back to the default rather
+    than crash at import (and never arm an instant-fire reaper)."""
+    raw = runtime.env("FLOWERS_ESCALATION_TTL_H")
+    if raw in (None, ""):
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+def _fast_path() -> bool:
+    """The single-action fast path (P1.3): on (default) skips the clarifier + planner for a self-contained
+    'email <one named address> saying <content>' (~5 -> <=2 model calls). FLOWERS_FAST_PATH=off (also 0 /
+    false / no) disables it -> even the canonical goal runs the full pipeline; any other value keeps the
+    default. Same env-knob pattern as :func:`_send_preview`."""
+    return runtime.env("FLOWERS_FAST_PATH").lower() not in ("off", "0", "false", "no")
+
+
 def build_app(*, db_path: str = "flowers.db", timers_path: str = "flowers_timers.db"):
     """Assemble the flowers REST API on the minimal local substrate (the published default).
 
@@ -88,16 +145,28 @@ def build_app(*, db_path: str = "flowers.db", timers_path: str = "flowers_timers
     degraded = (None if live_model.available() else
                 "no model is configured — set OPENROUTER_API_KEY in .env (see .env.example) and "
                 "restart; flowers cannot run goals without a model")
+    arcade = _pick(ArcadeIntegrations(), FakeIntegrations())
+    browser = _pick(BrowserbaseBrowser(context_store=store), FakeBrowser())  # store = browser-context registry
+    # A live side-effecting provider is wired -> tolerate its read-back lag; all-fakes stays instant.
+    live_io = isinstance(arcade, ArcadeIntegrations) or isinstance(browser, BrowserbaseBrowser)
+    verify_attempts, verify_delay = _verify_polling(live=live_io)
+    # NOTE: tests/ux/harness.py mirrors this Operator construction (it can't call build_app — the
+    # offline degrade would 503 every goal). If you add/change a knob or wrapping here, update the
+    # UX harness to match, or the usability regression floor silently tests stale wiring.
     operator = Operator(
         channel=channel,
         model=_pick(live_model, FakeModel([])),
         search=_pick(TavilySearch(), FakeSearch()),
-        integrations=_pick(ArcadeIntegrations(), FakeIntegrations()),
-        # the store doubles as the browser-context registry (persistent per-site logins).
-        browser=_pick(BrowserbaseBrowser(context_store=store), FakeBrowser()),
+        integrations=arcade,
+        browser=browser,
         store=store,
         timers=LocalTimers(timers_path),
         tracer=LocalTracer(),
+        verify_attempts=verify_attempts,
+        verify_delay=verify_delay,
+        send_preview=_send_preview(),
+        escalation_ttl_h=_escalation_ttl_h(),
+        fast_path_enabled=_fast_path(),
     )
     control_plane = ControlPlane(store=store, operator=operator)
     return create_app(control_plane, channel, poll_interval=_tick_seconds(default=15.0),
